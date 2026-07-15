@@ -1,0 +1,14 @@
+{
+  "protocolVersion": 2,
+  "canonicalRepository": "https://github.com/wetuscorp/wts.is.git",
+  "canonicalRef": "1574d538ea0840a3d0aa24f7946a96483e8c0c25",
+  "files": {
+    "contracts/v2/bootstrap-request.schema.json": "47694369e9b369df9a464e7768e7f04579592501074e0f8dbe8ebe8536c86550",
+    "contracts/v2/bootstrap-response.schema.json": "ccb826c334ece9e41ef5252fe2b145914b39d71d844711e30f0790e44815862c",
+    "contracts/v2/common.schema.json": "cd27104e61465ac77ee7b65e0ab0fb160f2caadfd233c8801d26939809100e02",
+    "contracts/v2/event-batch-response.schema.json": "eec5d61550655c9c97470c97e846a232027bd9fbe8a751a1c3986fcd98c7e26b",
+    "contracts/v2/event-batch.schema.json": "c64da57b900e829141c0d83d88d4133dd72b25641504af1fe24afcbcd6522a19",
+    "contracts/v2/fixtures/bootstrap-attribution.json": "141340c695b5f6dd403e12b008215e25cf5499af1266686b8a26745a45f5befb",
+    "contracts/v2/fixtures/event-batch-mixed.json": "9800eb57b2ccb77c314e7275167af7a2f3d88e76c565aa6a2daafcef5e875b72"
+  }
+}

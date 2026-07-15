@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wts.is/schemas/sdk/v2/bootstrap-request.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "clientEventId",
+    "anonymousId",
+    "sessionId",
+    "occurredAt",
+    "metadata"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 2 },
+    "clientEventId": { "type": "string", "format": "uuid" },
+    "anonymousId": { "type": "string", "format": "uuid" },
+    "sessionId": { "type": "string", "format": "uuid" },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "metadata": { "$ref": "common.schema.json#/$defs/metadata" },
+    "attributionToken": { "type": "string", "minLength": 32, "maxLength": 2048 }
+  }
+}

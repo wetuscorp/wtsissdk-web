@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>wts.is Web SDK script example</title>
+  </head>
+  <body>
+    <button id="grant">Grant consent and record page</button>
+    <script src="../../dist/wts-web.iife.min.js"></script>
+    <script>
+      const client = window.WtsWeb.createWtsClient({ sourceKey: "replace_with_source_key" });
+      document.querySelector("#grant").addEventListener("click", async () => {
+        await client.setConsent("granted");
+        await client.page("Plain HTML example");
+      });
+    </script>
+  </body>
+</html>

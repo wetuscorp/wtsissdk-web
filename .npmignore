@@ -1,0 +1,10 @@
+src/
+tests/
+examples/
+scripts/
+.github/
+coverage/
+playwright-report/
+test-results/
+*.config.*
+tsconfig.json

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wts.is/schemas/sdk/v2/bootstrap-response.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["accepted", "attributionContextId", "serverTime"],
+  "properties": {
+    "accepted": { "type": "boolean" },
+    "attributionContextId": { "type": ["string", "null"] },
+    "serverTime": { "type": "string", "format": "date-time" }
+  }
+}

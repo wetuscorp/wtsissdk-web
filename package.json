@@ -1,0 +1,70 @@
+{
+  "name": "@wetusco/web-sdk",
+  "version": "0.1.0-alpha.1",
+  "description": "Consent-first web analytics and deterministic link attribution for wts.is.",
+  "license": "Apache-2.0",
+  "author": "Wetus <info@wetus.co>",
+  "homepage": "https://wts.is/en/resources/docs/sdk-web",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wetuscorp/wtsissdk-web.git"
+  },
+  "bugs": "https://github.com/wetuscorp/wtsissdk-web/issues",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "SUPPORT.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "clean": "rimraf dist coverage",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint . --max-warnings=0",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --coverage",
+    "test:browser": "playwright test",
+    "verify:contracts": "node scripts/verify-contracts.mjs",
+    "verify:package": "node scripts/verify-package.mjs",
+    "verify": "npm run format:check && npm run lint && npm run typecheck && npm run test && npm run build && npm run verify:contracts && npm run verify:package",
+    "prepack": "npm run verify"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@playwright/test": "^1.57.0",
+    "@types/node": "^24.10.1",
+    "@vitest/coverage-v8": "^4.0.15",
+    "eslint": "^9.39.1",
+    "fake-indexeddb": "^6.2.5",
+    "happy-dom": "^20.0.11",
+    "prettier": "^3.7.4",
+    "rimraf": "^6.1.2",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.48.1",
+    "vitest": "^4.0.15"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "tag": "next"
+  }
+}
