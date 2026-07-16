@@ -6,6 +6,7 @@ import {
   validateExternalUserId,
   validateOptions,
   validateReportedAttribution,
+  validateUserAttributes,
   validateUserUpdate,
 } from "../src/validation";
 
@@ -35,6 +36,10 @@ describe("validation", () => {
         campaign: "summer_2026",
       }),
     ).not.toThrow();
+    expect(() =>
+      validateUserAttributes({ created_at: new Date("2026-07-16T10:00:00.000Z") }),
+    ).not.toThrow();
+    expect(() => validateUserAttributes({ created_at: new Date("invalid") })).toThrow(/valid Date/);
   });
 
   it("accepts localhost development collectors but requires HTTPS elsewhere", () => {

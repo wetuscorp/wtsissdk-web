@@ -23,6 +23,7 @@ class FakeTransport implements Transport {
   attributionContextId: string | null = null;
   serverTime = new Date().toISOString();
   batchResponse: ((events: WebEvent[]) => BatchResponse) | undefined;
+  identityBatchResponse: ((mutations: IdentityMutation[]) => IdentityBatchResponse) | undefined;
 
   async bootstrap(input: {
     sourceKey: string;
@@ -51,10 +52,12 @@ class FakeTransport implements Transport {
     mutations: IdentityMutation[],
   ): Promise<IdentityBatchResponse> {
     this.identityBatches.push(mutations);
-    return {
-      accepted: mutations.map((mutation) => mutation.clientMutationId),
-      duplicates: [],
-    };
+    return (
+      this.identityBatchResponse?.(mutations) ?? {
+        accepted: mutations.map((mutation) => mutation.clientMutationId),
+        duplicates: [],
+      }
+    );
   }
 }
 
@@ -214,6 +217,48 @@ describe("WtsClient", () => {
       "update_user",
     ]);
     expect(transport.batches.flat().some((event) => event.eventKey === "purchase")).toBe(true);
+  });
+
+  it("normalizes Date attributes and preserves opaque external user IDs", async () => {
+    const transport = new FakeTransport();
+    const client = new WtsClientImpl({ sourceKey: uniqueSource() }, transport);
+    clients.push(client);
+    await client.setConsent("granted");
+
+    await client.identify(" customer_1842 ", {
+      created_at: new Date("2026-07-16T10:00:00.000Z"),
+    });
+    await client.flush();
+
+    expect(transport.identityBatches.flat()[0]).toMatchObject({
+      externalUserId: " customer_1842 ",
+      attributes: { created_at: "2026-07-16T10:00:00.000Z" },
+    });
+  });
+
+  it("keeps retryable identity mutations ahead of product events", async () => {
+    const transport = new FakeTransport();
+    transport.identityBatchResponse = (mutations) => ({
+      accepted: [],
+      duplicates: [],
+      rejected: mutations.map((mutation) => ({
+        clientMutationId: mutation.clientMutationId,
+        code: "SERVICE_UNAVAILABLE",
+        message: "Retry later.",
+        retryable: true,
+      })),
+    });
+    const client = new WtsClientImpl({ sourceKey: uniqueSource() }, transport);
+    clients.push(client);
+    await client.setConsent("granted");
+
+    await client.identify("customer_1842");
+    await client.track("purchase");
+    await client.flush();
+
+    expect(transport.identityBatches).toHaveLength(1);
+    expect(transport.batches).toHaveLength(0);
+    expect(await client.flush()).toEqual({ sent: 0, pending: 2 });
   });
 
   it("resets the profile binding and rotates browser identity", async () => {

@@ -144,7 +144,7 @@ class IndexedDbStorage implements StorageAdapter {
     const store = transaction.objectStore(EVENT_STORE);
     const identityStore = transaction.objectStore(IDENTITY_STORE);
     store.put(event);
-    for (const queued of state.queue) {
+    for (const queued of existing.queue) {
       if (!retainedIds.has(queued.clientEventId)) store.delete(queued.clientEventId);
     }
     for (const mutation of state.identityQueue) identityStore.put(mutation);

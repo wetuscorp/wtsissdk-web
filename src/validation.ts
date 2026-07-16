@@ -137,6 +137,12 @@ function validateAttributeEntries(entries: Array<[string, unknown]>): void {
   if (entries.length > 50) throw new TypeError("A mutation can contain at most 50 attributes.");
   for (const [key, value] of entries) {
     validateAttributeKey(key);
+    if (value instanceof Date) {
+      if (Number.isNaN(value.getTime())) {
+        throw new TypeError(`Attribute ${key} must contain a valid Date.`);
+      }
+      continue;
+    }
     if (Array.isArray(value)) {
       if (
         value.length > 50 ||

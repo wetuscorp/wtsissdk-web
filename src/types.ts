@@ -1,7 +1,7 @@
 export type ConsentState = "pending" | "granted" | "denied";
 export type Scalar = string | number | boolean;
 export type EventProperties = Record<string, Scalar>;
-export type UserAttributeValue = Scalar | string[];
+export type UserAttributeValue = Scalar | string[] | Date;
 export type UserAttributes = Record<string, UserAttributeValue>;
 
 export interface Revenue {

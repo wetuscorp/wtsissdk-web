@@ -158,7 +158,9 @@ export class WtsClientImpl implements WtsClient {
     return this.enqueueIdentityMutation({
       type: "identify",
       externalUserId,
-      ...(Object.keys(attributes).length ? { attributes: { ...attributes } } : {}),
+      ...(Object.keys(attributes).length
+        ? { attributes: normalizeUserAttributes(attributes) }
+        : {}),
     });
   }
 
@@ -364,6 +366,9 @@ export class WtsClientImpl implements WtsClient {
           const permanentlyRejected = (identityResponse.rejected ?? [])
             .filter((item) => !item.retryable)
             .map((item) => item.clientMutationId);
+          const hasRetryableRejection = (identityResponse.rejected ?? []).some(
+            (item) => item.retryable,
+          );
           await this.storage.removeIdentity(
             new Set([
               ...identityResponse.accepted,
@@ -376,6 +381,17 @@ export class WtsClientImpl implements WtsClient {
               this.options.debug,
               `Collector permanently rejected ${permanentlyRejected.length} identity mutation(s).`,
             );
+          }
+          if (hasRetryableRejection) {
+            this.scheduleRetry();
+            const pendingState = await this.storage.load();
+            return {
+              sent:
+                identityResponse.accepted.length +
+                identityResponse.duplicates.length +
+                permanentlyRejected.length,
+              pending: pendingState.queue.length + pendingState.identityQueue.length,
+            };
           }
         } catch (error) {
           if (error instanceof TransportError && !error.retryable) {
@@ -491,6 +507,9 @@ export class WtsClientImpl implements WtsClient {
       metadata: { platform: "web", sdkVersion: SDK_VERSION, locale: locale() },
       ...value,
     };
+    if (byteLength({ schemaVersion: 1, mutations: [mutation] }) > MAX_BATCH_BYTES) {
+      throw new TypeError("Identity mutation cannot exceed 64 KiB.");
+    }
     await this.storage.enqueueIdentity(mutation);
     queueMicrotask(() => void this.flush());
     return { accepted: true, clientEventId: mutation.clientMutationId };
@@ -579,7 +598,10 @@ function takeBatch(queue: WebEvent[], attributionContextId?: string): WebEvent[]
 function takeIdentityBatch(queue: IdentityMutation[]): IdentityMutation[] {
   const batch: IdentityMutation[] = [];
   for (const mutation of queue.slice(0, MAX_BATCH_EVENTS)) {
-    if (byteLength({ schemaVersion: 1, mutations: [...batch, mutation] }) > MAX_BATCH_BYTES) break;
+    if (byteLength({ schemaVersion: 1, mutations: [...batch, mutation] }) > MAX_BATCH_BYTES) {
+      if (batch.length === 0) batch.push(mutation);
+      break;
+    }
     batch.push(mutation);
   }
   return batch;
@@ -587,4 +609,13 @@ function takeIdentityBatch(queue: IdentityMutation[]): IdentityMutation[] {
 
 function structuredCloneSafe<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function normalizeUserAttributes(attributes: UserAttributes): UserAttributes {
+  return Object.fromEntries(
+    Object.entries(attributes).map(([key, value]) => [
+      key,
+      value instanceof Date ? value.toISOString() : value,
+    ]),
+  );
 }

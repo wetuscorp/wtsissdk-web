@@ -2,7 +2,7 @@
 
 Consent-first browser measurement and deterministic wts.is link attribution. The SDK is dependency-free, safe to import during server rendering, and never collects DOM content, form values, URL queries, fragments, advertising identifiers, or fingerprints.
 
-> `0.1.0-alpha.2` is an early integration release using wts.is Web Protocol V2.
+> `0.2.0-alpha.1` adds consent-gated identity through Web Protocol V3 while retaining the existing page, event, and deterministic attribution behavior.
 
 ## Requirements
 
@@ -45,8 +45,8 @@ Use a versioned artifact and the SRI value shipped next to it. Do not use an unv
 
 ```html
 <script
-  src="https://cdn.jsdelivr.net/npm/@wetusco/wts-web-sdk@0.1.0-alpha.2/dist/wts-web.iife.min.js"
-  integrity="sha384-yd6nOlkavObZDFnbLq8jTn6bMrD8gIU+Er4oOqzNTa2Mo2VnD6wPG8VFZqVMIKyC"
+  src="https://cdn.jsdelivr.net/npm/@wetusco/wts-web-sdk@0.2.0-alpha.1/dist/wts-web.iife.min.js"
+  integrity="sha384-ahc9V9IOmrRpKErCHoXwXF8o78RvGqtJgDgHO2UEPjxqsj8RzvVuQugsK5IO4brh"
   crossorigin="anonymous"
 ></script>
 <script>
@@ -67,6 +67,34 @@ The IIFE exports `window.WtsWeb`. The release workflow records the exact SHA-384
 - The SDK does not persist the consent decision. Your CMP must call `setConsent` on each page load.
 
 Calls to `page` and `track` while pending or denied return an explicit no-op result. They are never retained in memory for later delivery.
+
+## User identity and reported attribution
+
+Identity operations use the same consent decision and are persisted ahead of product events. Use a stable, opaque internal customer ID rather than an email address. The ID is case-sensitive and is never trimmed or normalized by the SDK.
+
+```ts
+await wts.identify("customer_1842", {
+  email: "user@example.com",
+  plan: "enterprise",
+  created_at: new Date("2026-07-16T10:00:00.000Z"),
+});
+
+await wts.updateUser({
+  set: { plan: "business" },
+  setOnce: { signup_channel: "partner" },
+  increment: { lifetime_orders: 1 },
+});
+
+await wts.setReportedAttribution({
+  source: "newsletter",
+  medium: "email",
+  campaign: "summer_2026",
+});
+
+await wts.resetIdentity(); // call on logout
+```
+
+`resetIdentity()` closes the current profile binding and rotates the anonymous and session identities. Setting consent to `denied` clears all browser SDK storage and stops collection.
 
 The anonymous identity is first-party and persistent. The session identity and bootstrap idempotency key live in `sessionStorage`, so full-page navigations in the same browser session do not inflate session counts.
 
