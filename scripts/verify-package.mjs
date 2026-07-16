@@ -4,7 +4,7 @@ import { gzipSync } from "node:zlib";
 import { createRequire } from "node:module";
 
 const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-if (packageJson.name !== "@wetusco/web-sdk") throw new Error("Unexpected npm package name.");
+if (packageJson.name !== "@wetusco/wts-web-sdk") throw new Error("Unexpected npm package name.");
 if (Object.keys(packageJson.dependencies ?? {}).length > 0)
   throw new Error("Runtime dependencies are not allowed.");
 
