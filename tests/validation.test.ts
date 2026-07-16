@@ -1,12 +1,40 @@
 import { describe, expect, it } from "vitest";
 
-import { normalizePathname, validateEvent, validateOptions } from "../src/validation";
+import {
+  normalizePathname,
+  validateEvent,
+  validateExternalUserId,
+  validateOptions,
+  validateReportedAttribution,
+  validateUserUpdate,
+} from "../src/validation";
 
 describe("validation", () => {
   it("keeps pathname collection free of query and fragment data", () => {
     expect(normalizePathname("pricing")).toBe("/pricing");
     expect(() => normalizePathname("/pricing?member=true")).toThrow(/query or fragment/);
     expect(() => normalizePathname("/pricing#plans")).toThrow(/query or fragment/);
+  });
+
+  it("validates identity and atomic profile update operations", () => {
+    expect(() => validateExternalUserId("customer_1842")).not.toThrow();
+    expect(() =>
+      validateUserUpdate({
+        set: { plan: "business" },
+        setOnce: { signup_channel: "partner" },
+        increment: { lifetime_orders: 1 },
+      }),
+    ).not.toThrow();
+    expect(() => validateUserUpdate({ set: { plan: "business" }, unset: ["plan"] })).toThrow(
+      /only once/,
+    );
+    expect(() =>
+      validateReportedAttribution({
+        source: "newsletter",
+        medium: "email",
+        campaign: "summer_2026",
+      }),
+    ).not.toThrow();
   });
 
   it("accepts localhost development collectors but requires HTTPS elsewhere", () => {

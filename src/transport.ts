@@ -1,6 +1,13 @@
 import { SDK_VERSION } from "./constants";
 import { locale } from "./runtime";
-import type { BatchResponse, Identity, Transport, WebEvent } from "./types";
+import type {
+  BatchResponse,
+  Identity,
+  IdentityBatchResponse,
+  IdentityMutation,
+  Transport,
+  WebEvent,
+} from "./types";
 
 export class HttpTransport implements Transport {
   constructor(
@@ -15,10 +22,10 @@ export class HttpTransport implements Transport {
     attributionToken?: string;
   }): Promise<{ attributionContextId: string | null; serverTime: string }> {
     const response = await this.post(
-      "/v2/bootstrap",
+      "/v3/bootstrap",
       input.sourceKey,
       {
-        schemaVersion: 2,
+        schemaVersion: 3,
         clientEventId: input.clientEventId,
         ...input.identity,
         occurredAt: new Date().toISOString(),
@@ -32,12 +39,25 @@ export class HttpTransport implements Transport {
 
   async send(sourceKey: string, events: WebEvent[], keepalive: boolean): Promise<BatchResponse> {
     const response = await this.post(
-      "/v2/events/batch",
+      "/v3/events/batch",
       sourceKey,
-      { schemaVersion: 2, events },
+      { schemaVersion: 3, events },
       keepalive,
     );
     return (await response.json()) as BatchResponse;
+  }
+
+  async sendIdentity(
+    sourceKey: string,
+    mutations: IdentityMutation[],
+  ): Promise<IdentityBatchResponse> {
+    const response = await this.post(
+      "/v3/identity/mutations",
+      sourceKey,
+      { schemaVersion: 1, mutations },
+      false,
+    );
+    return (await response.json()) as IdentityBatchResponse;
   }
 
   private async post(

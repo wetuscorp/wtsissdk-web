@@ -2,7 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WtsClientImpl } from "../src/client";
 import { createStorage } from "../src/storage";
-import type { BatchResponse, Identity, Transport, WebEvent } from "../src/types";
+import type {
+  BatchResponse,
+  Identity,
+  IdentityBatchResponse,
+  IdentityMutation,
+  Transport,
+  WebEvent,
+} from "../src/types";
 
 class FakeTransport implements Transport {
   readonly bootstraps: Array<{
@@ -12,6 +19,7 @@ class FakeTransport implements Transport {
     attributionToken?: string;
   }> = [];
   readonly batches: WebEvent[][] = [];
+  readonly identityBatches: IdentityMutation[][] = [];
   attributionContextId: string | null = null;
   serverTime = new Date().toISOString();
   batchResponse: ((events: WebEvent[]) => BatchResponse) | undefined;
@@ -36,6 +44,17 @@ class FakeTransport implements Transport {
         rejected: [],
       }
     );
+  }
+
+  async sendIdentity(
+    _sourceKey: string,
+    mutations: IdentityMutation[],
+  ): Promise<IdentityBatchResponse> {
+    this.identityBatches.push(mutations);
+    return {
+      accepted: mutations.map((mutation) => mutation.clientMutationId),
+      duplicates: [],
+    };
   }
 }
 
@@ -112,6 +131,11 @@ describe("WtsClient", () => {
     await client.flush();
 
     expect(transport.bootstraps).toHaveLength(1);
+    await vi.waitFor(() =>
+      expect(transport.batches.flat().map((event) => event.type)).toEqual(
+        expect.arrayContaining(["page_view", "custom"]),
+      ),
+    );
     const sent = transport.batches.flat();
     expect(sent.map((event) => event.type)).toEqual(
       expect.arrayContaining(["page_view", "custom"]),
@@ -166,6 +190,50 @@ describe("WtsClient", () => {
     });
   });
 
+  it("flushes identify and user updates before subsequent product events", async () => {
+    const transport = new FakeTransport();
+    const client = new WtsClientImpl({ sourceKey: uniqueSource() }, transport);
+    clients.push(client);
+    await client.setConsent("granted");
+
+    await client.identify("customer_1842", {
+      plan: "enterprise",
+      country: "TR",
+      subscribed: true,
+    });
+    await client.updateUser({
+      set: { plan: "business" },
+      setOnce: { signup_channel: "partner" },
+      increment: { lifetime_orders: 1 },
+    });
+    await client.track("purchase");
+    await client.flush();
+
+    expect(transport.identityBatches.flat().map((mutation) => mutation.type)).toEqual([
+      "identify",
+      "update_user",
+    ]);
+    expect(transport.batches.flat().some((event) => event.eventKey === "purchase")).toBe(true);
+  });
+
+  it("resets the profile binding and rotates browser identity", async () => {
+    const transport = new FakeTransport();
+    const client = new WtsClientImpl({ sourceKey: uniqueSource() }, transport);
+    clients.push(client);
+    await client.setConsent("granted");
+    const before = transport.bootstraps[0]?.identity.anonymousId;
+
+    await expect(client.resetIdentity()).resolves.toMatchObject({ accepted: true });
+    await client.page();
+    await client.flush();
+
+    const identityMutations = transport.identityBatches.flat();
+    expect(identityMutations[identityMutations.length - 1]?.type).toBe("reset_identity");
+    expect(transport.bootstraps[transport.bootstraps.length - 1]?.identity.anonymousId).not.toBe(
+      before,
+    );
+  });
+
   it("deletes persisted SDK state when consent is denied before storage is opened", async () => {
     const sourceKey = uniqueSource();
     const previousStorage = await createStorage(sourceKey);
@@ -180,7 +248,7 @@ describe("WtsClient", () => {
     await client.setConsent("denied");
 
     const reopened = await createStorage(sourceKey);
-    await expect(reopened.load()).resolves.toEqual({ queue: [] });
+    await expect(reopened.load()).resolves.toEqual({ queue: [], identityQueue: [] });
     reopened.close();
   });
 

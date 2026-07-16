@@ -1,14 +1,18 @@
 {
-  "protocolVersion": 2,
+  "protocolVersion": 3,
+  "identityProtocolVersion": 1,
   "canonicalRepository": "https://github.com/wetuscorp/wts.is.git",
-  "canonicalRef": "1574d538ea0840a3d0aa24f7946a96483e8c0c25",
+  "canonicalRef": "protocol-v3-identity-v1",
   "files": {
-    "contracts/v2/bootstrap-request.schema.json": "47694369e9b369df9a464e7768e7f04579592501074e0f8dbe8ebe8536c86550",
-    "contracts/v2/bootstrap-response.schema.json": "ccb826c334ece9e41ef5252fe2b145914b39d71d844711e30f0790e44815862c",
-    "contracts/v2/common.schema.json": "cd27104e61465ac77ee7b65e0ab0fb160f2caadfd233c8801d26939809100e02",
-    "contracts/v2/event-batch-response.schema.json": "eec5d61550655c9c97470c97e846a232027bd9fbe8a751a1c3986fcd98c7e26b",
-    "contracts/v2/event-batch.schema.json": "c64da57b900e829141c0d83d88d4133dd72b25641504af1fe24afcbcd6522a19",
-    "contracts/v2/fixtures/bootstrap-attribution.json": "141340c695b5f6dd403e12b008215e25cf5499af1266686b8a26745a45f5befb",
-    "contracts/v2/fixtures/event-batch-mixed.json": "9800eb57b2ccb77c314e7275167af7a2f3d88e76c565aa6a2daafcef5e875b72"
+    "contracts/v3/bootstrap-request.schema.json": "a75cde10c4e1c928f204e96bfb137f5b3c64f870feae68a911e7006f7392a466",
+    "contracts/v3/bootstrap-response.schema.json": "c8dc221bf3f6f015fe889326e7b1d53850531222581659209ec334611d16b837",
+    "contracts/v3/common.schema.json": "68ca6004c32ad468f7377ed1930c1535b69b6e2e1f29d102a5b0c27aca58f4d7",
+    "contracts/v3/event-batch-response.schema.json": "efe928ba82fb960fa7c4ed3d077ab8aef8b8aaab9ee81830995dbc86a160454f",
+    "contracts/v3/event-batch.schema.json": "3b49033d8e7a8602f54661003db7a71e0df2c66777d8556dc5841ce6b9146b67",
+    "contracts/v3/fixtures/bootstrap-attribution.json": "5537c93a17cac459aaaf4962da08bed4ba11cfb1f5539089b453329534f6681b",
+    "contracts/v3/fixtures/event-batch-mixed.json": "f08ce59741b8e84250ce0df6e21290762da9cad765ba773444875a1462305bdb",
+    "contracts/identity/v1/identity-mutation-batch-response.schema.json": "86592957085940e0b3cce6f3ae18566fb833906d389ba0b45f8678d59a173ddc",
+    "contracts/identity/v1/identity-mutation-batch.schema.json": "3d364d03bfcc632d9e767f2e59d4d0424a8577b288e468adca578ff0b89896af",
+    "contracts/identity/v1/fixtures/identity-sequence.json": "c63a57c5203432f3fd91afda42dadec8e23ac99aaa5ea9682d1f6cc68df749db"
   }
 }

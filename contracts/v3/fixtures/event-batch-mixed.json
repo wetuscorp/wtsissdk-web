@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 3,
+  "events": [
+    {
+      "schemaVersion": 3,
+      "clientEventId": "9fa263ed-77a8-40fb-a5eb-06f235169d1b",
+      "anonymousId": "acb79ad1-5a57-49bf-a728-02e45365231c",
+      "sessionId": "952339a6-b7ba-46bc-a7cb-0471fa39356f",
+      "type": "page_view",
+      "occurredAt": "2026-07-16T10:00:01.000Z",
+      "metadata": { "platform": "web", "sdkVersion": "0.2.0-alpha.1", "locale": "tr-TR" },
+      "pathname": "/pricing",
+      "pageName": "Pricing",
+      "referrerHost": "www.google.com",
+      "properties": {}
+    },
+    {
+      "schemaVersion": 3,
+      "clientEventId": "35cbed31-a994-4ad5-8906-26b4516f87cb",
+      "anonymousId": "acb79ad1-5a57-49bf-a728-02e45365231c",
+      "sessionId": "952339a6-b7ba-46bc-a7cb-0471fa39356f",
+      "type": "custom",
+      "eventKey": "purchase",
+      "occurredAt": "2026-07-16T10:00:05.000Z",
+      "metadata": { "platform": "web", "sdkVersion": "0.2.0-alpha.1", "locale": "tr-TR" },
+      "properties": { "plan": "enterprise", "member": true },
+      "revenue": { "amount": "1490.50", "currency": "TRY" }
+    }
+  ]
+}

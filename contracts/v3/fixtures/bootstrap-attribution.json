@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 3,
+  "clientEventId": "8c36122b-38c0-40dc-bb45-65117b3adf94",
+  "anonymousId": "acb79ad1-5a57-49bf-a728-02e45365231c",
+  "sessionId": "952339a6-b7ba-46bc-a7cb-0471fa39356f",
+  "occurredAt": "2026-07-16T10:00:00.000Z",
+  "metadata": { "platform": "web", "sdkVersion": "0.2.0-alpha.1", "locale": "tr-TR" },
+  "attributionToken": "example-token-that-is-long-enough-for-contract-fixture"
+}

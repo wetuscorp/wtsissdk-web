@@ -18,15 +18,27 @@ import type {
   EventProperties,
   FlushResult,
   Identity,
+  IdentityMutation,
   OperationResult,
+  ReportedAttribution,
   Revenue,
   StorageAdapter,
   Transport,
+  UserAttributes,
+  UserUpdateOperations,
   WebEvent,
   WtsClient,
   WtsClientOptions,
 } from "./types";
-import { normalizePathname, validateEvent, validateOptions } from "./validation";
+import {
+  normalizePathname,
+  validateEvent,
+  validateExternalUserId,
+  validateOptions,
+  validateReportedAttribution,
+  validateUserAttributes,
+  validateUserUpdate,
+} from "./validation";
 
 type ResolvedOptions = ReturnType<typeof validateOptions>;
 const ATTRIBUTION_CONTEXT_TTL_MS = 7 * 24 * 60 * 60_000;
@@ -135,12 +147,71 @@ export class WtsClientImpl implements WtsClient {
     return { accepted: true, clientEventId: event.clientEventId };
   }
 
+  async identify(
+    externalUserId: string,
+    attributes: UserAttributes = {},
+  ): Promise<OperationResult> {
+    const unavailable = await this.prepareIdentityOperation();
+    if (unavailable) return unavailable;
+    validateExternalUserId(externalUserId);
+    validateUserAttributes(attributes);
+    return this.enqueueIdentityMutation({
+      type: "identify",
+      externalUserId,
+      ...(Object.keys(attributes).length ? { attributes: { ...attributes } } : {}),
+    });
+  }
+
+  async updateUser(operations: UserUpdateOperations): Promise<OperationResult> {
+    const unavailable = await this.prepareIdentityOperation();
+    if (unavailable) return unavailable;
+    validateUserUpdate(operations);
+    return this.enqueueIdentityMutation({
+      type: "update_user",
+      operations: structuredCloneSafe(operations),
+    });
+  }
+
+  async setReportedAttribution(attribution: ReportedAttribution): Promise<OperationResult> {
+    const unavailable = await this.prepareIdentityOperation();
+    if (unavailable) return unavailable;
+    validateReportedAttribution(attribution);
+    return this.enqueueIdentityMutation({
+      type: "reported_attribution",
+      attribution: { ...attribution },
+    });
+  }
+
+  async resetIdentity(): Promise<OperationResult> {
+    const unavailable = await this.prepareIdentityOperation();
+    if (unavailable) return unavailable;
+    const result = await this.enqueueIdentityMutation({ type: "reset_identity" });
+    if (!this.storage) return result;
+    this.identity = { anonymousId: createUuid(), sessionId: createUuid() };
+    this.bootstrapClientEventId = createUuid();
+    this.attributionContextId = undefined;
+    this.attributionContextExpiresAt = undefined;
+    this.attributionToken = undefined;
+    this.bootstrapped = false;
+    this.lastPagePath = undefined;
+    clearBrowserSession(this.options.sourceKey);
+    saveBrowserSession(this.options.sourceKey, {
+      sessionId: this.identity.sessionId,
+      bootstrapClientEventId: this.bootstrapClientEventId,
+    });
+    await this.storage.saveIdentity(this.identity);
+    await this.storage.saveAttributionContext();
+    return result;
+  }
+
   async flush(): Promise<FlushResult> {
     if (this.consent !== "granted" || this.destroyed || !this.storage) {
       return { sent: 0, pending: 0 };
     }
     const result = await this.lock.run(async () => this.flushExclusive(false));
-    return result ?? { sent: 0, pending: (await this.storage.load()).queue.length };
+    if (result) return result;
+    const state = await this.storage.load();
+    return { sent: 0, pending: state.queue.length + state.identityQueue.length };
   }
 
   async reset(): Promise<void> {
@@ -277,13 +348,61 @@ export class WtsClientImpl implements WtsClient {
   private async flushExclusive(keepalive: boolean): Promise<FlushResult> {
     if (!this.storage) return { sent: 0, pending: 0 };
     if (this.retryTimer && !keepalive) {
-      return { sent: 0, pending: (await this.storage.load()).queue.length };
+      const state = await this.storage.load();
+      return { sent: 0, pending: state.queue.length + state.identityQueue.length };
     }
     try {
       await this.ensureBootstrapped();
       const state = await this.storage.load();
-      const batch = takeBatch(state.queue, this.activeAttributionContextId());
-      if (batch.length === 0) return { sent: 0, pending: state.queue.length };
+      const identityBatch = takeIdentityBatch(state.identityQueue);
+      if (identityBatch.length > 0) {
+        try {
+          const identityResponse = await this.transport.sendIdentity(
+            this.options.sourceKey,
+            identityBatch,
+          );
+          const permanentlyRejected = (identityResponse.rejected ?? [])
+            .filter((item) => !item.retryable)
+            .map((item) => item.clientMutationId);
+          await this.storage.removeIdentity(
+            new Set([
+              ...identityResponse.accepted,
+              ...identityResponse.duplicates,
+              ...permanentlyRejected,
+            ]),
+          );
+          if (permanentlyRejected.length > 0) {
+            safeWarn(
+              this.options.debug,
+              `Collector permanently rejected ${permanentlyRejected.length} identity mutation(s).`,
+            );
+          }
+        } catch (error) {
+          if (error instanceof TransportError && !error.retryable) {
+            await this.storage.removeIdentity(
+              new Set(identityBatch.map((mutation) => mutation.clientMutationId)),
+            );
+            safeWarn(
+              this.options.debug,
+              `Collector rejected an identity mutation (${error.code ?? error.status}).`,
+            );
+          } else {
+            this.handleRetryableError(error);
+            return {
+              sent: 0,
+              pending: state.queue.length + state.identityQueue.length,
+            };
+          }
+        }
+      }
+      const refreshedState = await this.storage.load();
+      const batch = takeBatch(refreshedState.queue, this.activeAttributionContextId());
+      if (batch.length === 0) {
+        return {
+          sent: identityBatch.length,
+          pending: refreshedState.queue.length + refreshedState.identityQueue.length,
+        };
+      }
       const response = await this.transport.send(this.options.sourceKey, batch, keepalive);
       const remove = new Set([...response.accepted, ...response.duplicates]);
       let hasRetryableRejection = false;
@@ -292,16 +411,18 @@ export class WtsClientImpl implements WtsClient {
         else remove.add(rejection.clientEventId);
       }
       await this.storage.remove(remove);
-      const pending = (await this.storage.load()).queue.length;
+      const pendingState = await this.storage.load();
+      const pending = pendingState.queue.length + pendingState.identityQueue.length;
       if (hasRetryableRejection) this.scheduleRetry();
       else {
         this.retryAttempt = 0;
         if (pending > 0) queueMicrotask(() => void this.flush());
       }
-      return { sent: remove.size, pending };
+      return { sent: remove.size + identityBatch.length, pending };
     } catch (error) {
       this.handleRetryableError(error);
-      return { sent: 0, pending: (await this.storage.load()).queue.length };
+      const state = await this.storage.load();
+      return { sent: 0, pending: state.queue.length + state.identityQueue.length };
     }
   }
 
@@ -337,7 +458,7 @@ export class WtsClientImpl implements WtsClient {
     if (!this.identity) throw new Error("Web SDK identity is unavailable.");
     const attributionContextId = this.activeAttributionContextId();
     return {
-      schemaVersion: 2,
+      schemaVersion: 3,
       clientEventId: createUuid(),
       ...this.identity,
       type,
@@ -345,6 +466,34 @@ export class WtsClientImpl implements WtsClient {
       metadata: { platform: "web", sdkVersion: SDK_VERSION, locale: locale() },
       ...(attributionContextId ? { attributionContextId } : {}),
     };
+  }
+
+  private async prepareIdentityOperation(): Promise<OperationResult | undefined> {
+    let unavailable = this.unavailableResult();
+    if (unavailable) return unavailable;
+    await this.ensureReady();
+    unavailable = this.unavailableResult();
+    return unavailable;
+  }
+
+  private async enqueueIdentityMutation(
+    value: Omit<
+      IdentityMutation,
+      "schemaVersion" | "clientMutationId" | "occurredAt" | "identity" | "metadata"
+    >,
+  ): Promise<OperationResult> {
+    if (!this.storage || !this.identity) throw new Error("Web SDK identity is unavailable.");
+    const mutation: IdentityMutation = {
+      schemaVersion: 1,
+      clientMutationId: createUuid(),
+      occurredAt: new Date().toISOString(),
+      identity: { ...this.identity },
+      metadata: { platform: "web", sdkVersion: SDK_VERSION, locale: locale() },
+      ...value,
+    };
+    await this.storage.enqueueIdentity(mutation);
+    queueMicrotask(() => void this.flush());
+    return { accepted: true, clientEventId: mutation.clientMutationId };
   }
 
   private unavailableResult(): OperationResult | undefined {
@@ -421,8 +570,21 @@ function takeBatch(queue: WebEvent[], attributionContextId?: string): WebEvent[]
   const batch: WebEvent[] = [];
   for (const queued of queue.slice(0, MAX_BATCH_EVENTS)) {
     const event = attributionContextId ? { ...queued, attributionContextId } : queued;
-    if (byteLength({ schemaVersion: 2, events: [...batch, event] }) > MAX_BATCH_BYTES) break;
+    if (byteLength({ schemaVersion: 3, events: [...batch, event] }) > MAX_BATCH_BYTES) break;
     batch.push(event);
   }
   return batch;
+}
+
+function takeIdentityBatch(queue: IdentityMutation[]): IdentityMutation[] {
+  const batch: IdentityMutation[] = [];
+  for (const mutation of queue.slice(0, MAX_BATCH_EVENTS)) {
+    if (byteLength({ schemaVersion: 1, mutations: [...batch, mutation] }) > MAX_BATCH_BYTES) break;
+    batch.push(mutation);
+  }
+  return batch;
+}
+
+function structuredCloneSafe<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }

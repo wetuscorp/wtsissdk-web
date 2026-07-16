@@ -1,6 +1,19 @@
 # Changelog
 
+## 0.2.0-alpha.1
+
+- Added consent-gated `identify`, `updateUser`, `setReportedAttribution`, and `resetIdentity`.
+- Added a durable identity mutation queue that flushes before product events.
+- Added Web Protocol V3 collector support while retaining V2 server compatibility.
+
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and Semantic Versioning.
+
+## [0.1.0-alpha.2] - 2026-07-16
+
+### Changed
+
+- Renamed the canonical npm package to `@wetusco/wts-web-sdk`.
+- Preserved the Protocol V2 API and runtime behavior without integration changes.
 
 ## [0.1.0-alpha.1] - 2026-07-16
 

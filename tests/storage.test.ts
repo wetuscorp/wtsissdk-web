@@ -20,7 +20,7 @@ describe("MemoryStorage", () => {
 
 function event(index: number): WebEvent {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     clientEventId: uuid(index),
     anonymousId: "11111111-1111-4111-8111-111111111111",
     sessionId: "22222222-2222-4222-8222-222222222222",

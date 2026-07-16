@@ -1,8 +1,8 @@
-# @wetusco/web-sdk
+# @wetusco/wts-web-sdk
 
 Consent-first browser measurement and deterministic wts.is link attribution. The SDK is dependency-free, safe to import during server rendering, and never collects DOM content, form values, URL queries, fragments, advertising identifiers, or fingerprints.
 
-> `0.1.0-alpha.1` is an early integration release using wts.is Web Protocol V2.
+> `0.1.0-alpha.2` is an early integration release using wts.is Web Protocol V2.
 
 ## Requirements
 
@@ -14,11 +14,11 @@ Consent-first browser measurement and deterministic wts.is link attribution. The
 ## npm installation
 
 ```bash
-npm install @wetusco/web-sdk@next
+npm install @wetusco/wts-web-sdk@next
 ```
 
 ```ts
-import { createWtsClient } from "@wetusco/web-sdk";
+import { createWtsClient } from "@wetusco/wts-web-sdk";
 
 const wts = createWtsClient({
   sourceKey: "web_public_source_key",
@@ -45,8 +45,8 @@ Use a versioned artifact and the SRI value shipped next to it. Do not use an unv
 
 ```html
 <script
-  src="https://cdn.jsdelivr.net/npm/@wetusco/web-sdk@0.1.0-alpha.1/dist/wts-web.iife.min.js"
-  integrity="sha384-AT9pFPKCmzLiA3EKt8pWFGRx5Y0eg39PLnDE17L4UNanc7kxmeox4oG0QowjhBpr"
+  src="https://cdn.jsdelivr.net/npm/@wetusco/wts-web-sdk@0.1.0-alpha.2/dist/wts-web.iife.min.js"
+  integrity="sha384-yd6nOlkavObZDFnbLq8jTn6bMrD8gIU+Er4oOqzNTa2Mo2VnD6wPG8VFZqVMIKyC"
   crossorigin="anonymous"
 ></script>
 <script>
