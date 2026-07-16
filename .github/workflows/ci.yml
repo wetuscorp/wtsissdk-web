@@ -19,6 +19,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run verify
+      - run: node scripts/publish-release.test.mjs
       - run: npm pack --dry-run
       - name: Build Vite example
         run: |
