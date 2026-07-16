@@ -26,7 +26,7 @@ describe("HttpTransport", () => {
 
     expect(fetchMock).toHaveBeenCalledOnce();
     const [url, request] = fetchMock.mock.calls[0]!;
-    expect(url).toBe("https://collect.wts.is/v2/events/batch");
+    expect(url).toBe("https://collect.wts.is/v3/events/batch");
     expect(request).toMatchObject({
       method: "POST",
       credentials: "omit",
@@ -78,7 +78,7 @@ describe("HttpTransport", () => {
 });
 
 const EVENT: WebEvent = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   clientEventId: "00000000-0000-4000-8000-000000000001",
   anonymousId: "11111111-1111-4111-8111-111111111111",
   sessionId: "22222222-2222-4222-8222-222222222222",

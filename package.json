@@ -1,6 +1,6 @@
 {
   "name": "@wetusco/wts-web-sdk",
-  "version": "0.1.0-alpha.2",
+  "version": "0.2.0-alpha.1",
   "description": "Consent-first web analytics and deterministic link attribution for wts.is.",
   "license": "Apache-2.0",
   "author": "Wetus <info@wetus.co>",
@@ -66,5 +66,8 @@
     "access": "public",
     "provenance": true,
     "tag": "next"
+  },
+  "overrides": {
+    "esbuild": "0.28.1"
   }
 }

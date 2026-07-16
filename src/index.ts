@@ -7,7 +7,11 @@ export type {
   FlushResult,
   OperationResult,
   Revenue,
+  ReportedAttribution,
   Scalar,
+  UserAttributes,
+  UserAttributeValue,
+  UserUpdateOperations,
   WtsClient,
   WtsClientOptions,
 } from "./types";

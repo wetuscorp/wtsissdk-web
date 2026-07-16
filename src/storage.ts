@@ -1,9 +1,10 @@
 import { MAX_QUEUE_BYTES, MAX_QUEUE_EVENTS } from "./constants";
 import { byteLength } from "./runtime";
-import type { Identity, StorageAdapter, StoredState, WebEvent } from "./types";
+import type { Identity, IdentityMutation, StorageAdapter, StoredState, WebEvent } from "./types";
 
 const META_STORE = "meta";
 const EVENT_STORE = "events";
+const IDENTITY_STORE = "identity_mutations";
 
 export async function createStorage(sourceKey: string): Promise<StorageAdapter> {
   if (typeof indexedDB === "undefined") throw new Error("IndexedDB is unavailable.");
@@ -21,7 +22,7 @@ export async function deleteStorage(sourceKey: string): Promise<void> {
 }
 
 export class MemoryStorage implements StorageAdapter {
-  private state: StoredState = { queue: [] };
+  private state: StoredState = { queue: [], identityQueue: [] };
 
   async load(): Promise<StoredState> {
     return clone(this.state);
@@ -43,15 +44,26 @@ export class MemoryStorage implements StorageAdapter {
 
   async enqueue(event: WebEvent): Promise<void> {
     this.state.queue.push(clone(event));
-    trimQueue(this.state.queue);
+    trimQueues(this.state);
+  }
+
+  async enqueueIdentity(mutation: IdentityMutation): Promise<void> {
+    this.state.identityQueue.push(clone(mutation));
+    trimQueues(this.state);
   }
 
   async remove(clientEventIds: ReadonlySet<string>): Promise<void> {
     this.state.queue = this.state.queue.filter((event) => !clientEventIds.has(event.clientEventId));
   }
 
+  async removeIdentity(clientMutationIds: ReadonlySet<string>): Promise<void> {
+    this.state.identityQueue = this.state.identityQueue.filter(
+      (mutation) => !clientMutationIds.has(mutation.clientMutationId),
+    );
+  }
+
   async clear(): Promise<void> {
-    this.state = { queue: [] };
+    this.state = { queue: [], identityQueue: [] };
   }
 
   close(): void {}
@@ -61,35 +73,46 @@ class IndexedDbStorage implements StorageAdapter {
   private constructor(private readonly database: IDBDatabase) {}
 
   static async open(sourceKey: string): Promise<IndexedDbStorage> {
-    const request = indexedDB.open(databaseName(sourceKey), 1);
+    const request = indexedDB.open(databaseName(sourceKey), 2);
     request.onupgradeneeded = () => {
       const database = request.result;
       if (!database.objectStoreNames.contains(META_STORE)) database.createObjectStore(META_STORE);
       if (!database.objectStoreNames.contains(EVENT_STORE)) {
         database.createObjectStore(EVENT_STORE, { keyPath: "clientEventId" });
       }
+      if (!database.objectStoreNames.contains(IDENTITY_STORE)) {
+        database.createObjectStore(IDENTITY_STORE, { keyPath: "clientMutationId" });
+      }
     };
     return new IndexedDbStorage(await requestResult(request));
   }
 
   async load(): Promise<StoredState> {
-    const transaction = this.database.transaction([META_STORE, EVENT_STORE], "readonly");
+    const transaction = this.database.transaction(
+      [META_STORE, EVENT_STORE, IDENTITY_STORE],
+      "readonly",
+    );
     const meta = transaction.objectStore(META_STORE);
     const events = transaction.objectStore(EVENT_STORE);
-    const [identity, attributionContextId, attributionContextExpiresAt, queue] = await Promise.all([
-      requestResult(meta.get("identity") as IDBRequest<Identity | undefined>),
-      requestResult(meta.get("attributionContextId") as IDBRequest<string | undefined>),
-      requestResult(meta.get("attributionContextExpiresAt") as IDBRequest<string | undefined>),
-      requestResult(events.getAll() as IDBRequest<WebEvent[]>),
-    ]);
+    const mutations = transaction.objectStore(IDENTITY_STORE);
+    const [identity, attributionContextId, attributionContextExpiresAt, queue, identityQueue] =
+      await Promise.all([
+        requestResult(meta.get("identity") as IDBRequest<Identity | undefined>),
+        requestResult(meta.get("attributionContextId") as IDBRequest<string | undefined>),
+        requestResult(meta.get("attributionContextExpiresAt") as IDBRequest<string | undefined>),
+        requestResult(events.getAll() as IDBRequest<WebEvent[]>),
+        requestResult(mutations.getAll() as IDBRequest<IdentityMutation[]>),
+      ]);
     await transactionDone(transaction);
     queue.sort((left, right) => left.occurredAt.localeCompare(right.occurredAt));
+    identityQueue.sort((left, right) => left.occurredAt.localeCompare(right.occurredAt));
     return {
       ...(identity ? { identity } : {}),
       ...(attributionContextId && attributionContextExpiresAt
         ? { attributionContextId, attributionContextExpiresAt }
         : {}),
       queue,
+      identityQueue,
     };
   }
 
@@ -111,15 +134,46 @@ class IndexedDbStorage implements StorageAdapter {
   }
 
   async enqueue(event: WebEvent): Promise<void> {
-    const state = await this.load();
-    const queue = [...state.queue, event];
-    trimQueue(queue);
-    const retainedIds = new Set(queue.map((item) => item.clientEventId));
-    const transaction = this.database.transaction(EVENT_STORE, "readwrite");
+    const existing = await this.load();
+    const state = clone(existing);
+    state.queue.push(event);
+    trimQueues(state);
+    const retainedIds = new Set(state.queue.map((item) => item.clientEventId));
+    const retainedMutations = new Set(state.identityQueue.map((item) => item.clientMutationId));
+    const transaction = this.database.transaction([EVENT_STORE, IDENTITY_STORE], "readwrite");
     const store = transaction.objectStore(EVENT_STORE);
+    const identityStore = transaction.objectStore(IDENTITY_STORE);
     store.put(event);
-    for (const queued of state.queue) {
+    for (const queued of existing.queue) {
       if (!retainedIds.has(queued.clientEventId)) store.delete(queued.clientEventId);
+    }
+    for (const mutation of state.identityQueue) identityStore.put(mutation);
+    for (const mutation of existing.identityQueue) {
+      if (!retainedMutations.has(mutation.clientMutationId)) {
+        identityStore.delete(mutation.clientMutationId);
+      }
+    }
+    await transactionDone(transaction);
+  }
+
+  async enqueueIdentity(mutation: IdentityMutation): Promise<void> {
+    const existing = await this.load();
+    const state = clone(existing);
+    state.identityQueue.push(mutation);
+    trimQueues(state);
+    const retainedEvents = new Set(state.queue.map((item) => item.clientEventId));
+    const retainedMutations = new Set(state.identityQueue.map((item) => item.clientMutationId));
+    const transaction = this.database.transaction([EVENT_STORE, IDENTITY_STORE], "readwrite");
+    const eventStore = transaction.objectStore(EVENT_STORE);
+    const identityStore = transaction.objectStore(IDENTITY_STORE);
+    identityStore.put(mutation);
+    for (const event of existing.queue) {
+      if (!retainedEvents.has(event.clientEventId)) eventStore.delete(event.clientEventId);
+    }
+    for (const queued of existing.identityQueue) {
+      if (!retainedMutations.has(queued.clientMutationId)) {
+        identityStore.delete(queued.clientMutationId);
+      }
     }
     await transactionDone(transaction);
   }
@@ -132,10 +186,22 @@ class IndexedDbStorage implements StorageAdapter {
     await transactionDone(transaction);
   }
 
+  async removeIdentity(clientMutationIds: ReadonlySet<string>): Promise<void> {
+    if (clientMutationIds.size === 0) return;
+    const transaction = this.database.transaction(IDENTITY_STORE, "readwrite");
+    const store = transaction.objectStore(IDENTITY_STORE);
+    for (const id of clientMutationIds) store.delete(id);
+    await transactionDone(transaction);
+  }
+
   async clear(): Promise<void> {
-    const transaction = this.database.transaction([META_STORE, EVENT_STORE], "readwrite");
+    const transaction = this.database.transaction(
+      [META_STORE, EVENT_STORE, IDENTITY_STORE],
+      "readwrite",
+    );
     transaction.objectStore(META_STORE).clear();
     transaction.objectStore(EVENT_STORE).clear();
+    transaction.objectStore(IDENTITY_STORE).clear();
     await transactionDone(transaction);
   }
 
@@ -150,8 +216,14 @@ class IndexedDbStorage implements StorageAdapter {
   }
 }
 
-function trimQueue(queue: WebEvent[]): void {
-  while (queue.length > MAX_QUEUE_EVENTS || byteLength(queue) > MAX_QUEUE_BYTES) queue.shift();
+function trimQueues(state: StoredState): void {
+  while (
+    state.queue.length + state.identityQueue.length > MAX_QUEUE_EVENTS ||
+    byteLength({ events: state.queue, mutations: state.identityQueue }) > MAX_QUEUE_BYTES
+  ) {
+    if (state.queue.length > 0) state.queue.shift();
+    else state.identityQueue.shift();
+  }
 }
 
 function requestResult<T>(request: IDBRequest<T>): Promise<T> {
