@@ -1,4 +1,4 @@
-import { createWtsClient } from "@wetusco/web-sdk";
+import { createWtsClient } from "@wetusco/wts-web-sdk";
 
 const client = createWtsClient({ sourceKey: "replace_with_source_key" });
 document.querySelector("#grant")?.addEventListener("click", async () => {

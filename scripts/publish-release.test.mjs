@@ -59,7 +59,7 @@ function runScenario({
   copyFileSync(releaseScript, join(scriptsDirectory, "publish-release.mjs"));
   writeFileSync(
     join(root, "package.json"),
-    JSON.stringify({ name: "@wetusco/web-sdk", version: "0.1.0-alpha.1", type: "module" }),
+    JSON.stringify({ name: "@wetusco/wts-web-sdk", version: "0.1.0-alpha.2", type: "module" }),
   );
 
   const fakeNpm = join(binaryDirectory, "npm");
@@ -78,8 +78,8 @@ case "$1" in
     }
     ;;
   pack)
-    touch wetusco-web-sdk-0.1.0-alpha.1.tgz
-    printf '%s\\n' '[{"filename":"wetusco-web-sdk-0.1.0-alpha.1.tgz","shasum":"${localShasum}"}]'
+    touch wetusco-wts-web-sdk-0.1.0-alpha.2.tgz
+    printf '%s\\n' '[{"filename":"wetusco-wts-web-sdk-0.1.0-alpha.2.tgz","shasum":"${localShasum}"}]'
     ;;
   publish)
     ;;
