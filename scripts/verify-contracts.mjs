@@ -16,5 +16,5 @@ for (const [path, expected] of Object.entries(manifest.files)) {
 }
 
 console.log(
-  `Verified ${Object.keys(manifest.files).length} Protocol V3 and Identity V1 contract files.`,
+  `Verified ${Object.keys(manifest.files).length} Protocol V3, Identity V1, and Experiences V1 contract files.`,
 );

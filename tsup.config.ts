@@ -3,10 +3,21 @@ import { defineConfig } from "tsup";
 export default defineConfig([
   {
     entry: { index: "src/index.ts" },
-    format: ["esm", "cjs"],
+    format: ["esm"],
     dts: true,
     sourcemap: true,
     clean: true,
+    minify: true,
+    target: "es2020",
+    splitting: true,
+    treeshake: true,
+  },
+  {
+    entry: { index: "src/index.ts" },
+    format: ["cjs"],
+    dts: false,
+    sourcemap: true,
+    clean: false,
     minify: true,
     target: "es2020",
     splitting: false,

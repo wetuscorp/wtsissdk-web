@@ -293,7 +293,11 @@ describe("WtsClient", () => {
     await client.setConsent("denied");
 
     const reopened = await createStorage(sourceKey);
-    await expect(reopened.load()).resolves.toEqual({ queue: [], identityQueue: [] });
+    await expect(reopened.load()).resolves.toEqual({
+      queue: [],
+      identityQueue: [],
+      experienceQueue: [],
+    });
     reopened.close();
   });
 

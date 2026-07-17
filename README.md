@@ -2,7 +2,8 @@
 
 Consent-first browser measurement and deterministic wts.is link attribution. The SDK is dependency-free, safe to import during server rendering, and never collects DOM content, form values, URL queries, fragments, advertising identifiers, or fingerprints.
 
-> `0.2.0-alpha.1` adds consent-gated identity through Web Protocol V3 while retaining the existing page, event, and deterministic attribution behavior.
+> `0.3.0-alpha.1` adds opt-in wts.is Experiences delivery while retaining
+> Web Protocol V3 analytics, identity and deterministic attribution behavior.
 
 ## Requirements
 
@@ -45,8 +46,8 @@ Use a versioned artifact and the SRI value shipped next to it. Do not use an unv
 
 ```html
 <script
-  src="https://cdn.jsdelivr.net/npm/@wetusco/wts-web-sdk@0.2.0-alpha.1/dist/wts-web.iife.min.js"
-  integrity="sha384-ahc9V9IOmrRpKErCHoXwXF8o78RvGqtJgDgHO2UEPjxqsj8RzvVuQugsK5IO4brh"
+  src="https://cdn.jsdelivr.net/npm/@wetusco/wts-web-sdk@0.3.0-alpha.1/dist/wts-web.iife.min.js"
+  integrity="sha384-uflCoP1PZ6S4YUyrUMWa20BmD8EUOyPFRIV6m9FmFVA/xZXZrk7f0o8IGN1gkqyW"
   crossorigin="anonymous"
 ></script>
 <script>
@@ -108,6 +109,66 @@ await wts.page("Account overview");
 
 For client-side routers, set `autoTrackPageViews: true`. The SDK observes the initial pathname plus `pushState`, `replaceState`, and `popstate`, deduplicates repeated pathnames, and restores all listeners in `destroy()`. It only sends normalized pathname, optional page name, and referrer hostname.
 
+## Experiences
+
+Experiences is disabled by default even after upgrading. Enable it explicitly,
+provide action allowlists and pass a separate consent decision on every page
+load:
+
+```ts
+const wts = createWtsClient({
+  sourceKey: "web_public_source_key",
+  consent: "pending",
+  experiences: {
+    enabled: true,
+    renderMode: "automatic",
+    allowedInternalRoutes: ["/checkout", "/account"],
+    allowedCallbackKeys: ["apply_offer"],
+    allowedWebOrigins: ["https://www.example.com"],
+  },
+});
+
+await wts.setConsent("granted");
+await wts.setExperienceConsent("contextual");
+await wts.page("Checkout");
+```
+
+Use `personalized` only after profile consent and a completed `identify()`
+operation. `pending` makes no Experience request. `denied` removes cached
+manifest, assignment and unsent interaction data.
+
+Automatic mode loads the accessible Shadow DOM renderer only when a campaign
+is eligible. Manual mode reports eligible experiences through
+`onExperienceAvailable`; the host can call `presentNextExperience()` when its
+own UI is ready. Use `onExperienceAction` for allowlisted application
+callbacks. At most one experience is visible and the local candidate queue is
+bounded to five.
+
+An impression is recorded only after at least half of the experience remains
+visible for one uninterrupted second. Interaction delivery uses the persistent
+bounded queue, UUID idempotency and the same retry policy as product events.
+
+```ts
+const unsubscribe = wts.onExperienceAction(async ({ action }) => {
+  if (action.type === "CUSTOM_CALLBACK" && action.target === "apply_offer") {
+    await applyOffer();
+    return true;
+  }
+  return false;
+});
+
+await wts.presentNextExperience();
+await wts.dismissCurrentExperience();
+console.log(wts.getExperienceDiagnostics());
+unsubscribe();
+```
+
+For an unpublished device test, copy
+`wts.getExperienceDiagnostics().testDeviceToken` into the dashboard test
+panel for the same Web App. The random token is scoped to this SDK instance;
+it contains no user, browser, or profile identifier. Test impressions and
+conversions are excluded from customer analytics and usage.
+
 ## Link attribution
 
 When a wts.is link is assigned to the same Web App, the redirect adds a short-lived signed `_wts` token. The SDK removes it from the address bar, keeps it only in memory until consent, and redeems it for a seven-day attribution context. The raw token is not stored with events.
@@ -128,10 +189,12 @@ wts.destroy(); // removes timers and SPA/lifecycle listeners
 
 ## CSP
 
-Allow the collector in your Content Security Policy:
+Allow the collector and, when automatic Experiences rendering is enabled, the
+managed image CDN in your Content Security Policy:
 
 ```text
-connect-src 'self' https://collect.wts.is
+connect-src 'self' https://collect.wts.is;
+img-src 'self' https://assets.wts.is;
 ```
 
 ## Framework notes

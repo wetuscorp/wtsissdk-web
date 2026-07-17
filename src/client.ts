@@ -1,4 +1,5 @@
 import { ATTRIBUTION_QUERY_KEY, MAX_BATCH_BYTES, MAX_BATCH_EVENTS, SDK_VERSION } from "./constants";
+import { ExperienceRuntime } from "./experiences/runtime";
 import { MultiTabLock } from "./multitab-lock";
 import {
   byteLength,
@@ -16,6 +17,11 @@ import { HttpTransport, TransportError } from "./transport";
 import type {
   ConsentState,
   EventProperties,
+  ExperienceActionHandler,
+  ExperienceAvailableHandler,
+  ExperienceConsentResult,
+  ExperienceConsentState,
+  ExperienceDiagnostics,
   FlushResult,
   Identity,
   IdentityMutation,
@@ -61,6 +67,7 @@ export class WtsClientImpl implements WtsClient {
   private readonly options: ResolvedOptions;
   private readonly transport: Transport;
   private readonly lock: MultiTabLock;
+  private readonly experiences: ExperienceRuntime;
 
   constructor(options: WtsClientOptions, transport?: Transport) {
     this.options = validateOptions(options);
@@ -68,6 +75,17 @@ export class WtsClientImpl implements WtsClient {
     this.transport =
       transport ?? new HttpTransport(this.options.collectorOrigin, this.options.requestTimeoutMs);
     this.lock = new MultiTabLock(`flush-${this.options.sourceKey}`);
+    this.experiences = new ExperienceRuntime({
+      sourceKey: this.options.sourceKey,
+      collectorOrigin: this.options.collectorOrigin,
+      timeoutMs: this.options.requestTimeoutMs,
+      debug: this.options.debug,
+      options: this.options.experiences,
+      getAnalyticsConsent: () => this.consent,
+      getIdentity: () => this.identity,
+      getStorage: () => this.storage,
+      flushIdentity: async () => this.lock.run(async () => this.flushExclusive(false)),
+    });
     this.attributionToken = captureAttributionToken();
     this.installLifecycleListeners();
     if (this.consent === "granted") void this.startEnable();
@@ -99,6 +117,7 @@ export class WtsClientImpl implements WtsClient {
       this.bootstrapped = false;
       clearBrowserSession(this.options.sourceKey);
       this.removeSpaTracking();
+      await this.experiences.setConsent("denied");
       return;
     }
     const wasGranted = this.consent === "granted";
@@ -123,6 +142,13 @@ export class WtsClientImpl implements WtsClient {
     };
     await this.enqueue(event);
     this.lastPagePath = pathname;
+    await this.experiences.evaluate({
+      trigger: { type: "page_view", match: { kind: "pathname_exact", value: pathname } },
+      pathname,
+      ...(event.pageName ? { pageName: event.pageName } : {}),
+      properties: {},
+      triggerEventId: event.clientEventId,
+    });
     return { accepted: true, clientEventId: event.clientEventId };
   }
 
@@ -144,6 +170,12 @@ export class WtsClientImpl implements WtsClient {
       ...(revenue ? { revenue: { ...revenue } } : {}),
     };
     await this.enqueue(event);
+    await this.experiences.evaluate({
+      trigger: { type: "custom_event", eventKey, conditions: [] },
+      eventKey,
+      properties,
+      triggerEventId: event.clientEventId,
+    });
     return { accepted: true, clientEventId: event.clientEventId };
   }
 
@@ -203,7 +235,32 @@ export class WtsClientImpl implements WtsClient {
     });
     await this.storage.saveIdentity(this.identity);
     await this.storage.saveAttributionContext();
+    await this.experiences.identityChanged();
     return result;
+  }
+
+  setExperienceConsent(consent: ExperienceConsentState): Promise<ExperienceConsentResult> {
+    return this.experiences.setConsent(consent);
+  }
+
+  onExperienceAction(handler: ExperienceActionHandler): () => void {
+    return this.experiences.onAction(handler);
+  }
+
+  onExperienceAvailable(handler: ExperienceAvailableHandler): () => void {
+    return this.experiences.onAvailable(handler);
+  }
+
+  presentNextExperience(): Promise<boolean> {
+    return this.experiences.presentNext();
+  }
+
+  dismissCurrentExperience(): Promise<boolean> {
+    return this.experiences.dismissCurrent();
+  }
+
+  getExperienceDiagnostics(): ExperienceDiagnostics {
+    return this.experiences.diagnostics();
   }
 
   async flush(): Promise<FlushResult> {
@@ -211,9 +268,13 @@ export class WtsClientImpl implements WtsClient {
       return { sent: 0, pending: 0 };
     }
     const result = await this.lock.run(async () => this.flushExclusive(false));
+    await this.experiences.flushInteractions();
     if (result) return result;
     const state = await this.storage.load();
-    return { sent: 0, pending: state.queue.length + state.identityQueue.length };
+    return {
+      sent: 0,
+      pending: state.queue.length + state.identityQueue.length + state.experienceQueue.length,
+    };
   }
 
   async reset(): Promise<void> {
@@ -227,6 +288,7 @@ export class WtsClientImpl implements WtsClient {
     this.bootstrapClientEventId = createUuid();
     this.bootstrapped = false;
     this.lastPagePath = undefined;
+    await this.experiences.reset();
     if (this.consent === "granted" && !this.destroyed) await this.initializeIdentity();
   }
 
@@ -236,6 +298,7 @@ export class WtsClientImpl implements WtsClient {
     this.cancelRetry();
     this.removeSpaTracking();
     this.removeLifecycleListeners();
+    this.experiences.destroy();
     const storage = this.storage;
     if (storage) void this.lock.run(async () => storage.close());
   }
@@ -351,7 +414,10 @@ export class WtsClientImpl implements WtsClient {
     if (!this.storage) return { sent: 0, pending: 0 };
     if (this.retryTimer && !keepalive) {
       const state = await this.storage.load();
-      return { sent: 0, pending: state.queue.length + state.identityQueue.length };
+      return {
+        sent: 0,
+        pending: state.queue.length + state.identityQueue.length + state.experienceQueue.length,
+      };
     }
     try {
       await this.ensureBootstrapped();
@@ -390,7 +456,10 @@ export class WtsClientImpl implements WtsClient {
                 identityResponse.accepted.length +
                 identityResponse.duplicates.length +
                 permanentlyRejected.length,
-              pending: pendingState.queue.length + pendingState.identityQueue.length,
+              pending:
+                pendingState.queue.length +
+                pendingState.identityQueue.length +
+                pendingState.experienceQueue.length,
             };
           }
         } catch (error) {
@@ -406,7 +475,8 @@ export class WtsClientImpl implements WtsClient {
             this.handleRetryableError(error);
             return {
               sent: 0,
-              pending: state.queue.length + state.identityQueue.length,
+              pending:
+                state.queue.length + state.identityQueue.length + state.experienceQueue.length,
             };
           }
         }
@@ -416,7 +486,10 @@ export class WtsClientImpl implements WtsClient {
       if (batch.length === 0) {
         return {
           sent: identityBatch.length,
-          pending: refreshedState.queue.length + refreshedState.identityQueue.length,
+          pending:
+            refreshedState.queue.length +
+            refreshedState.identityQueue.length +
+            refreshedState.experienceQueue.length,
         };
       }
       const response = await this.transport.send(this.options.sourceKey, batch, keepalive);
@@ -428,7 +501,10 @@ export class WtsClientImpl implements WtsClient {
       }
       await this.storage.remove(remove);
       const pendingState = await this.storage.load();
-      const pending = pendingState.queue.length + pendingState.identityQueue.length;
+      const pending =
+        pendingState.queue.length +
+        pendingState.identityQueue.length +
+        pendingState.experienceQueue.length;
       if (hasRetryableRejection) this.scheduleRetry();
       else {
         this.retryAttempt = 0;
@@ -438,7 +514,10 @@ export class WtsClientImpl implements WtsClient {
     } catch (error) {
       this.handleRetryableError(error);
       const state = await this.storage.load();
-      return { sent: 0, pending: state.queue.length + state.identityQueue.length };
+      return {
+        sent: 0,
+        pending: state.queue.length + state.identityQueue.length + state.experienceQueue.length,
+      };
     }
   }
 
