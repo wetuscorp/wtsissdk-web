@@ -2,6 +2,18 @@
 
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and Semantic Versioning.
 
+## Unreleased
+
+- Applied signed Experience semantic background, text, and accent tokens through
+  a closed renderer-owned CSS vocabulary; arbitrary CSS values remain ignored.
+- Kept an automatic Experience visible and unrecorded when an allowlisted
+  `CUSTOM_CALLBACK` has no host handler that accepts it.
+- Allowed asynchronous manual presentation handlers and captured their failures
+  as deterministic Experience diagnostics.
+- Prevented verified-manifest expiry from rendering a stale queued candidate.
+- Cleared pending Experience interactions when `resetIdentity()` creates a new
+  anonymous actor.
+
 ## 0.4.0-alpha.1
 
 - Require a host-pinned Ed25519 public-key ring to verify Experience manifests

@@ -1,5 +1,36 @@
-import type { ExperienceAction, ExperienceLocalizedContent } from "../types";
+import type {
+  ExperienceAccentToken,
+  ExperienceAction,
+  ExperienceBackgroundToken,
+  ExperienceContent,
+  ExperienceLocalizedContent,
+  ExperienceTextToken,
+} from "../types";
 import type { QueuedExperience } from "./types";
+
+const BACKGROUND_TOKEN_VALUES: Record<ExperienceBackgroundToken, string> = {
+  surface: "#ffffff",
+  subtle: "#f8fafc",
+  inverse: "#071120",
+  brand: "linear-gradient(145deg, #071b34, #0b3260)",
+};
+
+const TEXT_TOKEN_VALUES: Record<ExperienceTextToken, string> = {
+  primary: "#0b1220",
+  muted: "#334155",
+  inverse: "#f8fafc",
+};
+
+const ACCENT_TOKEN_VALUES: Record<
+  ExperienceAccentToken,
+  { background: string; foreground: string }
+> = {
+  primary: { background: "#13b8dc", foreground: "#04131d" },
+  secondary: { background: "#0b3260", foreground: "#f8fafc" },
+  success: { background: "#15803d", foreground: "#ffffff" },
+  warning: { background: "#b45309", foreground: "#ffffff" },
+  danger: { background: "#dc2626", foreground: "#ffffff" },
+};
 
 export interface RenderCallbacks {
   locale: string;
@@ -29,6 +60,7 @@ export async function renderExperience(
   backdrop.className = `backdrop placement-${experience.placement}`;
   const surface = document.createElement("section");
   surface.className = `surface theme-${experience.content.themePreset}`;
+  applyContentTokens(host, experience.content);
   surface.setAttribute("role", "dialog");
   surface.setAttribute("aria-modal", experience.placement === "modal" ? "true" : "false");
   surface.setAttribute("aria-labelledby", `wts-title-${experience.exposureId}`);
@@ -215,6 +247,36 @@ function appendContent(
   }
 }
 
+/**
+ * A manifest is untrusted input, even after its signature is verified. Map the
+ * semantic content tokens to a closed vocabulary before assigning CSS custom
+ * properties, so a campaign can never inject arbitrary CSS into the host app.
+ */
+function applyContentTokens(host: HTMLElement, content: ExperienceContent): void {
+  const background = resolveToken(content.backgroundToken, BACKGROUND_TOKEN_VALUES);
+  if (background) {
+    host.style.setProperty("--wts-experience-background-override", background);
+  }
+
+  const text = resolveToken(content.textToken, TEXT_TOKEN_VALUES);
+  if (text) {
+    host.style.setProperty("--wts-experience-text-override", text);
+  }
+
+  const accent = resolveToken(content.accentToken, ACCENT_TOKEN_VALUES);
+  if (accent) {
+    host.style.setProperty("--wts-experience-accent-override", accent.background);
+    host.style.setProperty("--wts-experience-accent-foreground-override", accent.foreground);
+  }
+}
+
+function resolveToken<T>(token: unknown, values: Record<string, T>): T | undefined {
+  if (typeof token !== "string" || !Object.prototype.hasOwnProperty.call(values, token)) {
+    return undefined;
+  }
+  return values[token];
+}
+
 function selectTranslation(
   translations: Record<string, ExperienceLocalizedContent>,
   requestedLocale: string,
@@ -235,7 +297,9 @@ function focusableElements(root: HTMLElement): HTMLElement[] {
 function createStyle() {
   const style = document.createElement("style");
   style.textContent = `
-    :host { all: initial; position: fixed; inset: 0; z-index: 2147483000; pointer-events: none; }
+    :host { all: initial; position: fixed; inset: 0; z-index: 2147483000; pointer-events: none;
+      --wts-experience-background: #fff; --wts-experience-text: #0b1220;
+      --wts-experience-accent: #13b8dc; --wts-experience-accent-foreground: #04131d; }
     .backdrop { position: fixed; inset: 0; display: flex; padding: 20px; box-sizing: border-box;
       font-family: Manrope, ui-sans-serif, system-ui, sans-serif; color: #0b1220; pointer-events: none; }
     .placement-modal { align-items: center; justify-content: center; background: rgba(2, 8, 23, .52); pointer-events: auto; }
@@ -243,12 +307,18 @@ function createStyle() {
     .placement-bottom_banner { align-items: flex-end; justify-content: center; }
     .placement-slide_in { align-items: flex-end; justify-content: flex-end; }
     .surface { pointer-events: auto; position: relative; width: min(100%, 520px); overflow: hidden;
-      border-radius: 20px; box-shadow: 0 24px 80px rgba(2,8,23,.28); background: #fff; color: #0b1220;
+      border-radius: 20px; box-shadow: 0 24px 80px rgba(2,8,23,.28);
+      background: var(--wts-experience-background-override, var(--wts-experience-background));
+      color: var(--wts-experience-text-override, var(--wts-experience-text));
       border: 1px solid rgba(148,163,184,.28); transform: translateZ(0); }
     .placement-top_banner .surface,.placement-bottom_banner .surface { width: min(100%, 920px); border-radius: 14px; }
     .placement-slide_in .surface { width: min(100%, 400px); }
-    .theme-dark { background: #071120; color: #f8fafc; border-color: rgba(148,163,184,.2); }
-    .theme-brand { background: linear-gradient(145deg,#071b34,#0b3260); color: #f8fafc; border-color: rgba(34,211,238,.25); }
+    .theme-dark { --wts-experience-background: #071120; --wts-experience-text: #f8fafc;
+      --wts-experience-accent: #22d3ee; --wts-experience-accent-foreground: #04131d;
+      border-color: rgba(148,163,184,.2); }
+    .theme-brand { --wts-experience-background: linear-gradient(145deg,#071b34,#0b3260);
+      --wts-experience-text: #f8fafc; --wts-experience-accent: #22d3ee;
+      --wts-experience-accent-foreground: #04131d; border-color: rgba(34,211,238,.25); }
     .asset { display: block; width: 100%; max-height: 280px; object-fit: cover; }
     .body { padding: 28px; }
     h2 { margin: 0; font: 700 24px/1.2 Manrope,ui-sans-serif,system-ui,sans-serif; letter-spacing: -.025em; }
@@ -256,11 +326,12 @@ function createStyle() {
     .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 24px; }
     button { border: 0; border-radius: 10px; min-height: 42px; padding: 10px 16px; cursor: pointer;
       font: 700 14px/1 Manrope,ui-sans-serif,system-ui,sans-serif; }
-    .primary { background: #13b8dc; color: #04131d; }
+    .primary { background: var(--wts-experience-accent-override, var(--wts-experience-accent));
+      color: var(--wts-experience-accent-foreground-override, var(--wts-experience-accent-foreground)); }
     .secondary { background: rgba(148,163,184,.16); color: inherit; }
     .close { position: absolute; top: 12px; right: 12px; min-height: 36px; width: 36px; padding: 0;
       border-radius: 999px; background: rgba(15,23,42,.12); color: inherit; font-size: 22px; }
-    button:focus-visible { outline: 3px solid #22d3ee; outline-offset: 3px; }
+    button:focus-visible { outline: 3px solid var(--wts-experience-accent-override, var(--wts-experience-accent)); outline-offset: 3px; }
     @media (prefers-reduced-motion: no-preference) {
       .surface { animation: wts-enter .2s cubic-bezier(.2,.8,.2,1) both; }
       @keyframes wts-enter { from { opacity: 0; transform: translateY(10px) scale(.985); } }

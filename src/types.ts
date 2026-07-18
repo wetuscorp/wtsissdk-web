@@ -64,13 +64,32 @@ export interface ExperienceLocalizedContent {
   secondaryAction?: ExperienceAction;
 }
 
+/**
+ * Semantic colour tokens accepted by the automatic web renderer.
+ *
+ * These are identifiers, not CSS values. Unknown values from a future
+ * manifest are ignored safely and the selected theme preset remains in use.
+ */
+export type ExperienceBackgroundToken = "surface" | "subtle" | "inverse" | "brand";
+export type ExperienceTextToken = "primary" | "muted" | "inverse";
+export type ExperienceAccentToken = "primary" | "secondary" | "success" | "warning" | "danger";
+/** Preserves forward compatibility with newer server-issued semantic tokens. */
+export type ExperienceBackgroundTokenValue = ExperienceBackgroundToken | (string & {});
+/** Preserves forward compatibility with newer server-issued semantic tokens. */
+export type ExperienceTextTokenValue = ExperienceTextToken | (string & {});
+/** Preserves forward compatibility with newer server-issued semantic tokens. */
+export type ExperienceAccentTokenValue = ExperienceAccentToken | (string & {});
+
 export interface ExperienceContent {
   translations: Record<string, ExperienceLocalizedContent>;
   closeable: boolean;
   themePreset: "light" | "dark" | "brand";
-  backgroundToken?: string;
-  textToken?: string;
-  accentToken?: string;
+  /** A safe semantic token applied as the automatic renderer background. */
+  backgroundToken?: ExperienceBackgroundTokenValue;
+  /** A safe semantic token applied as the automatic renderer text colour. */
+  textToken?: ExperienceTextTokenValue;
+  /** A safe semantic token applied as the automatic renderer primary-action accent. */
+  accentToken?: ExperienceAccentTokenValue;
   delaySeconds: number;
   autoCloseSeconds: number | null;
 }
@@ -141,6 +160,7 @@ export interface ExperiencePresentationResult {
     | "feature_disabled"
     | "manual_mode_required"
     | "consent_required"
+    | "manifest_expired"
     | "presentation_not_found"
     | "presentation_not_presenting"
     | "session_overlay_limit_reached"
@@ -160,7 +180,14 @@ export interface ExperienceDismissal {
 export type ExperienceActionHandler = (
   event: ExperienceActionEvent,
 ) => void | boolean | Promise<void | boolean>;
-export type ExperienceAvailableHandler = (presentation: WtsExperienceManualPresentation) => void;
+/**
+ * Manual render handlers may complete asynchronously. Rejections are captured
+ * by the SDK and surfaced through Experience diagnostics; they never become
+ * unhandled promise rejections.
+ */
+export type ExperienceAvailableHandler = (
+  presentation: WtsExperienceManualPresentation,
+) => void | Promise<void>;
 
 export interface OperationResult {
   accepted: boolean;

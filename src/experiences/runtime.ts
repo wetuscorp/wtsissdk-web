@@ -196,7 +196,11 @@ export class ExperienceRuntime {
           candidateVersionIds: manifest.campaigns.map((item) => item.campaignVersionId),
           context: { ...runtimeContext, trigger: context.trigger },
         });
-        await this.acceptDecisions(response.decisions, runtimeContext);
+        await this.acceptDecisions(
+          response.decisions,
+          runtimeContext,
+          Date.parse(manifest.expiresAt),
+        );
       } catch (error) {
         this.handleError(error);
       }
@@ -207,11 +211,15 @@ export class ExperienceRuntime {
       .filter((campaign) => triggerMatches(campaign, runtimeContext))
       .filter((campaign) => targetingMatches(campaign.targeting, manifest, this.metadata.locale))
       .sort(compareCampaigns);
-    for (const campaign of candidates) await this.acceptManifestCampaign(campaign, runtimeContext);
+    const manifestExpiresAt = Date.parse(manifest.expiresAt);
+    for (const campaign of candidates) {
+      await this.acceptManifestCampaign(campaign, runtimeContext, manifestExpiresAt);
+    }
   }
 
   async presentNext(): Promise<boolean> {
     if (this.dependencies.options.renderMode !== "automatic") return false;
+    this.discardExpiredCandidates();
     if (
       !this.canEvaluate() ||
       this.current ||
@@ -280,6 +288,9 @@ export class ExperienceRuntime {
   async acknowledgeExperienceRender(handle: string): Promise<ExperiencePresentationResult> {
     const unavailable = this.manualPresentationUnavailable();
     if (unavailable) return unavailable;
+    if (this.discardExpiredCandidates().has(handle)) {
+      return this.presentationRejected("manifest_expired");
+    }
     const state = this.manualPresentations.get(handle);
     if (!state) return this.presentationRejected("presentation_not_found");
     if (state.rendered) return this.presentationAccepted(true);
@@ -376,6 +387,7 @@ export class ExperienceRuntime {
   }
 
   diagnostics(): ExperienceDiagnostics {
+    this.discardExpiredCandidates();
     return {
       enabled: this.dependencies.options.enabled,
       consent: this.consent,
@@ -437,7 +449,10 @@ export class ExperienceRuntime {
   }
 
   async identityChanged(): Promise<void> {
-    await this.clearRuntimeState(false);
+    // A reset creates a new anonymous actor. Pending interactions must not be
+    // delivered under that new identity, or old-user Experiences would be
+    // attributed to the next person using the same browser.
+    await this.clearRuntimeState(true);
     if (this.canEvaluate()) {
       try {
         await this.ensureManifest(true);
@@ -506,6 +521,7 @@ export class ExperienceRuntime {
   private async acceptManifestCampaign(
     campaign: ManifestCampaign,
     context: RuntimeContext,
+    manifestExpiresAt: number,
   ): Promise<void> {
     const assignment = campaign.assignment;
     if (!assignment || !campaign.grant) return;
@@ -540,6 +556,7 @@ export class ExperienceRuntime {
         grant: campaign.grant,
         defaultLocale: campaign.defaultLocale,
         eligibleAt: Date.now(),
+        manifestExpiresAt,
         ...(context.triggerEventId ? { triggerEventId: context.triggerEventId } : {}),
       },
       context,
@@ -549,6 +566,7 @@ export class ExperienceRuntime {
   private async acceptDecisions(
     decisions: ExperienceDecision[],
     context: RuntimeContext,
+    manifestExpiresAt: number,
   ): Promise<void> {
     for (const decision of decisions) {
       if (decision.holdout) {
@@ -582,6 +600,7 @@ export class ExperienceRuntime {
           grant: decision.grant,
           defaultLocale: "en",
           eligibleAt: Date.now(),
+          manifestExpiresAt,
           ...(context.triggerEventId ? { triggerEventId: context.triggerEventId } : {}),
         },
         context,
@@ -590,6 +609,7 @@ export class ExperienceRuntime {
   }
 
   private async enqueueCandidate(candidate: QueuedExperience, context: RuntimeContext) {
+    if (this.isCandidateExpired(candidate)) return;
     if (
       this.queue.some(
         (item) =>
@@ -683,6 +703,13 @@ export class ExperienceRuntime {
         this.handleError(error);
       }
     }
+    if (!handled && action.type === "CUSTOM_CALLBACK") {
+      // A callback target is an opaque host-app contract. An allowlist alone
+      // must never make the SDK claim it ran a callback: retain the surface so
+      // the host can register a handler or let the user dismiss it.
+      this.lastErrorCode = "EXPERIENCE_CALLBACK_UNHANDLED";
+      return;
+    }
     if (!handled) handled = await this.performSafeDefaultAction(action);
     const content = selectLocalizedContent(experience.content.translations, this.metadata.locale);
     await this.record(
@@ -714,7 +741,7 @@ export class ExperienceRuntime {
         window.dispatchEvent(new PopStateEvent("popstate"));
         return true;
       case "CUSTOM_CALLBACK":
-        return Boolean(target && this.dependencies.options.allowedCallbackKeys.includes(target));
+        return false;
       case "OPEN_WEB_URL":
         if (!target) return false;
         return this.openWebUrl(target);
@@ -834,6 +861,7 @@ export class ExperienceRuntime {
   }
 
   private offerNextManualCandidate(): void {
+    this.discardExpiredCandidates();
     if (
       this.destroyed ||
       this.dependencies.options.renderMode !== "manual" ||
@@ -855,11 +883,18 @@ export class ExperienceRuntime {
       handle: candidate.presentationHandle,
     };
     for (const handler of this.availableHandlers) {
-      try {
-        handler(presentation);
-      } catch (error) {
-        this.handleError(error);
-      }
+      this.notifyAvailableHandler(handler, presentation);
+    }
+  }
+
+  private notifyAvailableHandler(
+    handler: ExperienceAvailableHandler,
+    presentation: WtsExperienceManualPresentation,
+  ): void {
+    try {
+      void Promise.resolve(handler(presentation)).catch(() => this.handleManualHandlerError());
+    } catch {
+      this.handleManualHandlerError();
     }
   }
 
@@ -892,6 +927,26 @@ export class ExperienceRuntime {
         this.manualOfferedHandle = undefined;
       }
     }
+  }
+
+  private discardExpiredCandidates(): Set<string> {
+    const expiredHandles = new Set<string>();
+    const now = Date.now();
+    this.queue = this.queue.filter((candidate) => {
+      if (!this.isCandidateExpired(candidate, now)) return true;
+      expiredHandles.add(candidate.presentationHandle);
+      const state = this.manualPresentations.get(candidate.presentationHandle);
+      if (state) state.dismissed = true;
+      if (this.manualOfferedHandle === candidate.presentationHandle) {
+        this.manualOfferedHandle = undefined;
+      }
+      return false;
+    });
+    return expiredHandles;
+  }
+
+  private isCandidateExpired(candidate: QueuedExperience, now = Date.now()): boolean {
+    return !Number.isFinite(candidate.manifestExpiresAt) || candidate.manifestExpiresAt <= now;
   }
 
   private sortQueue(): void {
@@ -1012,6 +1067,11 @@ export class ExperienceRuntime {
   private handleError(error: unknown) {
     this.lastErrorCode = normalizeErrorCode(error);
     safeWarn(this.dependencies.debug, `Experiences request failed (${this.lastErrorCode}).`);
+  }
+
+  private handleManualHandlerError(): void {
+    this.lastErrorCode = "EXPERIENCE_MANUAL_HANDLER_FAILED";
+    safeWarn(this.dependencies.debug, "Experience manual presentation handler failed.");
   }
 
   private canEvaluate(): boolean {
