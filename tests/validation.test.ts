@@ -51,6 +51,36 @@ describe("validation", () => {
     ).toThrow(/HTTPS/);
   });
 
+  it("requires pinned manifest keys and exact host-only HTTPS deep-link allowlists", () => {
+    expect(
+      validateOptions({
+        sourceKey: "web_source_key",
+        experiences: {
+          enabled: true,
+          manifestVerificationKeys: { current_1: "AA==" },
+          allowedDeepLinkHosts: ["Links.Example.com"],
+        },
+      }),
+    ).toMatchObject({
+      experiences: {
+        manifestVerificationKeys: { current_1: "AA==" },
+        allowedDeepLinkHosts: ["links.example.com"],
+      },
+    });
+    expect(() =>
+      validateOptions({
+        sourceKey: "web_source_key",
+        experiences: { enabled: true, allowedDeepLinkSchemes: ["https"] },
+      }),
+    ).toThrow(/allowedDeepLinkHosts/);
+    expect(() =>
+      validateOptions({
+        sourceKey: "web_source_key",
+        experiences: { enabled: true, allowedDeepLinkHosts: ["https://links.example.com"] },
+      }),
+    ).toThrow(/hostname only/);
+  });
+
   it("enforces scalar properties and decimal revenue", () => {
     expect(() =>
       validateEvent(

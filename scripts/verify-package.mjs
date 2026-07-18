@@ -16,8 +16,14 @@ if (gzipBytes > 15 * 1024) throw new Error(`IIFE gzip budget exceeded: ${gzipByt
 const testSessionIife = await readFile(
   new URL("../dist/wts-web-test-session.iife.min.js", import.meta.url),
 );
+const experiencesIife = await readFile(
+  new URL("../dist/wts-web-experiences.iife.min.js", import.meta.url),
+);
 if (!iife.includes("wts-web-test-session.iife.min.js")) {
   throw new Error("The primary IIFE must retain the lazy SDK Test & Validate loader.");
+}
+if (!iife.includes("wts-web-experiences.iife.min.js")) {
+  throw new Error("The primary IIFE must retain the lazy Experiences loader.");
 }
 for (const method of ["joinTestSession", "leaveTestSession", "getTestSessionDiagnostics"]) {
   if (!iife.includes(method)) {
@@ -27,6 +33,9 @@ for (const method of ["joinTestSession", "leaveTestSession", "getTestSessionDiag
 if (!testSessionIife.includes("__wtsWebTestSessionFactory")) {
   throw new Error("The SDK Test & Validate companion IIFE does not expose its runtime factory.");
 }
+if (!experiencesIife.includes("__wtsWebExperiencesFactory")) {
+  throw new Error("The Experiences companion IIFE does not expose its runtime factory.");
+}
 await verifyIifeTestSessionFacade(iife, testSessionIife);
 
 const sri = `sha384-${createHash("sha384").update(iife).digest("base64")}`;
@@ -35,6 +44,12 @@ const testSessionSri = `sha384-${createHash("sha384").update(testSessionIife).di
 await writeFile(
   new URL("../dist/wts-web-test-session.iife.min.js.sri", import.meta.url),
   `${testSessionSri}\n`,
+  "utf8",
+);
+const experiencesSri = `sha384-${createHash("sha384").update(experiencesIife).digest("base64")}`;
+await writeFile(
+  new URL("../dist/wts-web-experiences.iife.min.js.sri", import.meta.url),
+  `${experiencesSri}\n`,
   "utf8",
 );
 
@@ -83,7 +98,7 @@ async function verifyIifeTestSessionFacade(iifeSource, testSessionSource) {
         },
         sessionToken: "t".repeat(32),
         testProfile: { externalUserId: "test_profile_package" },
-        requiredSdkVersion: "0.3.0-alpha.1",
+        requiredSdkVersion: "0.4.0-alpha.1",
         testPlan: emptyTestPlan(),
       });
     }
@@ -91,7 +106,7 @@ async function verifyIifeTestSessionFacade(iifeSource, testSessionSource) {
       return jsonResponse({
         accepted: true,
         compatible: true,
-        requiredSdkVersion: "0.3.0-alpha.1",
+        requiredSdkVersion: "0.4.0-alpha.1",
         checks: [],
         testPlan: emptyTestPlan(),
       });

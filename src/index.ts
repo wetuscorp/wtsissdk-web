@@ -13,9 +13,11 @@ export type {
   ExperienceConsentState,
   ExperienceContent,
   ExperienceDiagnostics,
+  ExperienceDismissal,
   ExperienceLocalizedContent,
   ExperienceOptions,
   ExperiencePlacement,
+  ExperiencePresentationResult,
   ExperienceRenderMode,
   FlushResult,
   OperationResult,
@@ -35,6 +37,8 @@ export type {
   UserUpdateOperations,
   WtsClient,
   WtsClientOptions,
+  WtsExperience,
+  WtsExperienceManualPresentation,
 } from "./types";
 
 export function createWtsClient(options: WtsClientOptions): WtsClient {

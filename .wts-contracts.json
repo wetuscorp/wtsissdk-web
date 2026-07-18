@@ -16,7 +16,7 @@
     "contracts/identity/v1/identity-mutation-batch.schema.json": "3d364d03bfcc632d9e767f2e59d4d0424a8577b288e468adca578ff0b89896af",
     "contracts/identity/v1/fixtures/identity-sequence.json": "c63a57c5203432f3fd91afda42dadec8e23ac99aaa5ea9682d1f6cc68df749db",
     "contracts/experiences/v1/bootstrap-request.schema.json": "1699e913045e83224eb1301aecc880049dabb277a8eec5df278b511fc712da65",
-    "contracts/experiences/v1/bootstrap-response.schema.json": "da3e1c546b533c47c1a4b49554b06f6b5eddd0210293fe4a8214db07500e12e6",
+    "contracts/experiences/v1/bootstrap-response.schema.json": "ce205884f4a38d11ad6198f1cf30520559cb089243501b6b6b6857633f7f4d4a",
     "contracts/experiences/v1/common.schema.json": "6399cff20579ec99cb58119cbede047fe0b99fd2115bda789f7aa1080e426eb4",
     "contracts/experiences/v1/decision-request.schema.json": "135dba4030bff30900cab855ae075b50bc901ee963138df28f642858cf0ac050",
     "contracts/experiences/v1/decision-response.schema.json": "193d0739d3fa92f8d236131296d707d6bbd60ec1e4b5eb85afcf1e80f2a1f0da",

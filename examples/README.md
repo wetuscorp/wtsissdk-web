@@ -29,4 +29,4 @@ short-lived session.
 Do not put the dashboard-issued pairing credential in source code, logs, or
 application storage. The isolated queue is bounded and separate from
 production analytics. These APIs require a matching published web SDK release;
-the `0.3.0-alpha.1` source line is not a package-publication claim.
+the `0.4.0-alpha.1` source line is not a package-publication claim.

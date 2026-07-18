@@ -2,9 +2,23 @@
 
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and Semantic Versioning.
 
-> The `0.3.0-alpha.1` source line below is not an npm publication claim.
+> The `0.4.0-alpha.1` source line below is not an npm publication claim.
 > Consume SDK Test & Validate only from its matching published web package
 > release.
+
+## 0.4.0-alpha.1
+
+- Require a host-pinned Ed25519 public-key ring to verify Experience manifests
+  before any manifest payload is parsed or used.
+- Added explicit in-memory profile consent for personalized Experiences without
+  changing existing analytics or identity consent behavior.
+- Hardened HTTPS deep-link actions to exact hostname allowlists and reject
+  HTTPS scheme-only authorization.
+- Defined the manual presentation contract with opaque handles, idempotent
+  lifecycle acknowledgements, queue-head-only offers, and cooldown-safe next
+  offers after dismissal or render failure.
+- Cancel delayed automatic rendering when consent changes or the client is
+  destroyed.
 
 ## 0.3.0-alpha.1
 

@@ -1,16 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { generateKeyPairSync, sign } from "node:crypto";
 
 import { WtsClientImpl } from "../src/client";
 import { renderExperience } from "../src/experiences/renderer";
+import type { ExperienceManifest, QueuedExperience } from "../src/experiences/types";
 import type {
-  AvailableExperience,
   BatchResponse,
   Identity,
   IdentityBatchResponse,
   IdentityMutation,
+  ExperienceOptions,
+  ExperienceAvailableHandler,
   Transport,
   WebEvent,
 } from "../src/types";
+
+const manifestKeyPair = generateKeyPairSync("ed25519");
+const manifestVerificationKeys = {
+  v1: manifestKeyPair.publicKey.export({ type: "spki", format: "der" }).toString("base64"),
+};
 
 class AnalyticsTransport implements Transport {
   async bootstrap(input: { sourceKey: string; identity: Identity; clientEventId: string }) {
@@ -117,16 +125,15 @@ describe("Web Experiences", () => {
       {
         sourceKey: sourceKey(),
         consent: "granted",
-        experiences: {
-          enabled: true,
+        experiences: experienceOptions({
           renderMode: "manual",
           allowedInternalRoutes: ["/plans"],
-        },
+        }),
       },
       new AnalyticsTransport(),
     );
     clients.push(client);
-    const available = vi.fn();
+    const available = vi.fn<ExperienceAvailableHandler>();
     client.onExperienceAvailable(available);
 
     await client.setExperienceConsent("contextual");
@@ -134,11 +141,13 @@ describe("Web Experiences", () => {
     await vi.waitFor(() => expect(available).toHaveBeenCalledTimes(1));
     await client.flush();
 
-    expect(available.mock.calls[0]?.[0]).toMatchObject({
+    const initialPresentation = available.mock.calls[0]?.[0];
+    expect(initialPresentation?.experience).toMatchObject({
       campaignId: "campaign_1",
       placement: "modal",
       content: { closeable: true },
     });
+    expect(typeof initialPresentation?.handle).toBe("string");
     expect(client.getExperienceDiagnostics()).toMatchObject({
       enabled: true,
       consent: "contextual",
@@ -175,7 +184,7 @@ describe("Web Experiences", () => {
       {
         sourceKey: sourceKey(),
         consent: "granted",
-        experiences: { enabled: true, renderMode: "manual" },
+        experiences: experienceOptions({ renderMode: "manual" }),
       },
       new AnalyticsTransport(),
     );
@@ -189,6 +198,269 @@ describe("Web Experiences", () => {
       queued: 0,
       presenting: false,
     });
+  });
+
+  it("offers only the queued manual head, supports idempotent lifecycle reports, and then offers next", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = requestUrl(input);
+        if (url.endsWith("/experiences/v1/bootstrap")) {
+          return jsonResponse(bootstrapFixture({ secondaryCampaign: true }));
+        }
+        if (url.endsWith("/experiences/v1/interactions/batch")) {
+          const body = JSON.parse(requestBody(init)) as {
+            interactions: Array<{ clientInteractionId: string }>;
+          };
+          return jsonResponse({
+            accepted: body.interactions.map((item) => item.clientInteractionId),
+            duplicates: [],
+            rejected: [],
+          });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+    const client = new WtsClientImpl(
+      {
+        sourceKey: sourceKey(),
+        consent: "granted",
+        experiences: experienceOptions({ renderMode: "manual" }),
+      },
+      new AnalyticsTransport(),
+    );
+    clients.push(client);
+    const available = vi.fn<ExperienceAvailableHandler>();
+    client.onExperienceAvailable(available);
+
+    await client.setExperienceConsent("contextual");
+    await client.page("Checkout");
+    expect(available).toHaveBeenCalledTimes(1);
+    const first = available.mock.calls[0]?.[0];
+    expect(first).toMatchObject({
+      experience: { campaignId: "campaign_1" },
+    });
+    expect(typeof first?.handle).toBe("string");
+    expect(first?.experience).not.toHaveProperty("exposureId");
+    expect(first?.experience).not.toHaveProperty("grant");
+    await expect(client.presentNextExperience()).resolves.toBe(false);
+
+    await expect(client.acknowledgeExperienceRender(first!.handle)).resolves.toEqual({
+      accepted: true,
+      idempotent: false,
+    });
+    await expect(client.acknowledgeExperienceRender(first!.handle)).resolves.toEqual({
+      accepted: true,
+      idempotent: true,
+    });
+    await expect(client.acknowledgeExperienceImpression(first!.handle)).resolves.toEqual({
+      accepted: true,
+      idempotent: false,
+    });
+    await expect(client.acknowledgeExperienceImpression(first!.handle)).resolves.toEqual({
+      accepted: true,
+      idempotent: true,
+    });
+    await expect(client.reportExperienceAction(first!.handle, "primary")).resolves.toEqual({
+      accepted: true,
+      idempotent: false,
+    });
+    await expect(client.reportExperienceAction(first!.handle, "primary")).resolves.toEqual({
+      accepted: true,
+      idempotent: true,
+    });
+    await expect(client.dismissExperience(first!.handle)).resolves.toEqual({
+      accepted: true,
+      idempotent: false,
+    });
+    await expect(client.dismissExperience(first!.handle)).resolves.toEqual({
+      accepted: true,
+      idempotent: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 3_050));
+    expect(available).toHaveBeenCalledTimes(2);
+    const second = available.mock.calls[1]?.[0];
+    expect(second?.experience).toMatchObject({ campaignId: "campaign_2" });
+    expect(typeof second?.handle).toBe("string");
+  });
+
+  it("offers an already queued manual head when the handler subscribes", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        if (requestUrl(input).endsWith("/experiences/v1/bootstrap")) {
+          return jsonResponse(bootstrapFixture());
+        }
+        const body = JSON.parse(requestBody(init)) as {
+          interactions: Array<{ clientInteractionId: string }>;
+        };
+        return jsonResponse({
+          accepted: body.interactions.map((item) => item.clientInteractionId),
+          duplicates: [],
+          rejected: [],
+        });
+      }),
+    );
+    const client = new WtsClientImpl(
+      {
+        sourceKey: sourceKey(),
+        consent: "granted",
+        experiences: experienceOptions({ renderMode: "manual" }),
+      },
+      new AnalyticsTransport(),
+    );
+    clients.push(client);
+    await client.setExperienceConsent("contextual");
+    await client.page("Checkout");
+
+    const available = vi.fn();
+    client.onExperienceAvailable(available);
+    expect(available).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when a manifest signature cannot be verified", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        if (!requestUrl(input).endsWith("/experiences/v1/bootstrap")) {
+          throw new Error("Interactions must not be sent for an untrusted manifest.");
+        }
+        return jsonResponse({ ...bootstrapFixture(), signature: "invalid" });
+      }),
+    );
+    const client = new WtsClientImpl(
+      {
+        sourceKey: sourceKey(),
+        consent: "granted",
+        experiences: experienceOptions({ renderMode: "manual" }),
+      },
+      new AnalyticsTransport(),
+    );
+    clients.push(client);
+    const available = vi.fn();
+    client.onExperienceAvailable(available);
+
+    await expect(client.setExperienceConsent("contextual")).resolves.toEqual({ accepted: true });
+    await client.page("Checkout");
+    expect(available).not.toHaveBeenCalled();
+    expect(client.getExperienceDiagnostics().lastErrorCode).toBe(
+      "EXPERIENCE_MANIFEST_SIGNATURE_INVALID",
+    );
+  });
+
+  it("fails closed when bootstrap names an unpinned manifest key", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        if (!requestUrl(input).endsWith("/experiences/v1/bootstrap")) {
+          throw new Error("Interactions must not be sent for an untrusted manifest.");
+        }
+        return jsonResponse({ ...bootstrapFixture(), keyId: "rotated_key" });
+      }),
+    );
+    const client = new WtsClientImpl(
+      {
+        sourceKey: sourceKey(),
+        consent: "granted",
+        experiences: experienceOptions({ renderMode: "manual" }),
+      },
+      new AnalyticsTransport(),
+    );
+    clients.push(client);
+
+    await client.setExperienceConsent("contextual");
+    await client.page("Checkout");
+    expect(client.getExperienceDiagnostics().lastErrorCode).toBe(
+      "EXPERIENCE_MANIFEST_KEY_UNTRUSTED",
+    );
+  });
+
+  it("requires an explicit profile-consent signal for personalized Experiences", async () => {
+    const profileConsentSignals: boolean[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        if (requestUrl(input).endsWith("/experiences/v1/bootstrap")) {
+          profileConsentSignals.push(
+            (JSON.parse(requestBody(init)) as { profileConsentGranted: boolean })
+              .profileConsentGranted,
+          );
+          return jsonResponse(bootstrapFixture());
+        }
+        const body = JSON.parse(requestBody(init)) as {
+          interactions: Array<{ clientInteractionId: string }>;
+        };
+        return jsonResponse({
+          accepted: body.interactions.map((item) => item.clientInteractionId),
+          duplicates: [],
+          rejected: [],
+        });
+      }),
+    );
+    const client = new WtsClientImpl(
+      {
+        sourceKey: sourceKey(),
+        consent: "granted",
+        experiences: experienceOptions({ renderMode: "manual" }),
+      },
+      new AnalyticsTransport(),
+    );
+    clients.push(client);
+    await client.page("Checkout");
+    await expect(client.setExperienceConsent("personalized")).resolves.toEqual({
+      accepted: false,
+      reason: "profile_consent_required",
+    });
+
+    await client.setProfileConsent(true);
+    await expect(client.setExperienceConsent("personalized")).resolves.toEqual({ accepted: true });
+    expect(profileConsentSignals).toEqual([true]);
+
+    await client.setProfileConsent(false);
+    expect(client.getExperienceDiagnostics().consent).toBe("pending");
+  });
+
+  it("never invokes manual callbacks in automatic mode and aborts a delayed render on consent denial", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = requestUrl(input);
+        if (url.endsWith("/experiences/v1/bootstrap")) {
+          return jsonResponse(bootstrapFixture({ delaySeconds: 10 }));
+        }
+        if (url.endsWith("/experiences/v1/interactions/batch")) {
+          const body = JSON.parse(requestBody(init)) as {
+            interactions: Array<{ clientInteractionId: string }>;
+          };
+          return jsonResponse({
+            accepted: body.interactions.map((item) => item.clientInteractionId),
+            duplicates: [],
+            rejected: [],
+          });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+    const client = new WtsClientImpl(
+      {
+        sourceKey: sourceKey(),
+        consent: "granted",
+        experiences: experienceOptions({ renderMode: "automatic" }),
+      },
+      new AnalyticsTransport(),
+    );
+    clients.push(client);
+    const available = vi.fn();
+    client.onExperienceAvailable(available);
+
+    await client.setExperienceConsent("contextual");
+    await client.page("Checkout");
+    await vi.waitFor(() => expect(document.querySelector("[data-wts-experience]")).not.toBeNull());
+    expect(available).not.toHaveBeenCalled();
+
+    await client.setExperienceConsent("denied");
+    expect(document.querySelector("[data-wts-experience]")).toBeNull();
+    expect(client.getExperienceDiagnostics().presenting).toBe(false);
   });
 
   it("renders an accessible isolated surface and verifies impressions after one second", async () => {
@@ -258,75 +530,127 @@ describe("Web Experiences", () => {
     expect(document.querySelector("[data-wts-experience='exposure_1']")).toBeNull();
     expect(document.activeElement).toBe(previousFocus);
   });
+
+  it("removes a delayed renderer surface when its lifecycle signal is aborted", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const onDismiss = vi.fn();
+    const pending = renderExperience(availableExperienceFixture({ delaySeconds: 5 }), {
+      locale: "en",
+      signal: controller.signal,
+      onAction: vi.fn(),
+      onDismiss,
+      onImpression: vi.fn(),
+    });
+    expect(document.querySelector("[data-wts-experience='exposure_1']")).not.toBeNull();
+
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(document.querySelector("[data-wts-experience='exposure_1']")).toBeNull();
+    expect(onDismiss).not.toHaveBeenCalled();
+  });
 });
 
-function bootstrapFixture() {
+function bootstrapFixture(
+  options: { delaySeconds?: number; rawManifest?: unknown; secondaryCampaign?: boolean } = {},
+) {
   const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
-  return {
-    manifest: {
-      schemaVersion: 1,
-      sourceId: "source_1",
-      sourceManifestVersion: 7,
-      generatedAt: new Date().toISOString(),
-      expiresAt,
-      campaigns: [
-        {
-          campaignId: "campaign_1",
-          campaignVersionId: "version_1",
-          priority: 10,
-          startsAt: null,
-          endsAt: null,
-          placement: "modal",
-          defaultLocale: "en",
-          trigger: {
-            type: "page_view",
-            match: { kind: "pathname_exact", value: "/checkout" },
-          },
-          targeting: {
-            kind: "condition",
-            field: "platform",
-            operator: "equals",
-            value: "web",
-          },
-          frequency: { session: 1, daily: 1 },
-          variants: [
-            {
-              id: "variant_1",
-              key: "control",
-              content: {
-                translations: {
-                  en: {
-                    title: "Complete your order",
-                    description: "Your cart is ready.",
-                    primaryAction: {
-                      id: "primary",
-                      label: "Continue",
-                      type: "OPEN_INTERNAL_ROUTE",
-                      target: "/plans",
-                    },
+  const manifest: ExperienceManifest = {
+    schemaVersion: 1,
+    sourceId: "source_1",
+    sourceManifestVersion: 7,
+    generatedAt: new Date().toISOString(),
+    expiresAt,
+    campaigns: [
+      {
+        campaignId: "campaign_1",
+        campaignVersionId: "version_1",
+        priority: 10,
+        startsAt: null,
+        endsAt: null,
+        placement: "modal",
+        defaultLocale: "en",
+        trigger: {
+          type: "page_view",
+          match: { kind: "pathname_exact", value: "/checkout" },
+        },
+        targeting: {
+          kind: "condition",
+          field: "platform",
+          operator: "equals",
+          value: "web",
+        },
+        frequency: { session: 1, daily: 1 },
+        variants: [
+          {
+            id: "variant_1",
+            key: "control",
+            content: {
+              translations: {
+                en: {
+                  title: "Complete your order",
+                  description: "Your cart is ready.",
+                  primaryAction: {
+                    id: "primary",
+                    label: "Continue",
+                    type: "OPEN_INTERNAL_ROUTE",
+                    target: "/plans",
                   },
                 },
-                closeable: true,
-                themePreset: "brand",
-                delaySeconds: 0,
-                autoCloseSeconds: null,
               },
-              asset: null,
+              closeable: true,
+              themePreset: "brand",
+              delaySeconds: options.delaySeconds ?? 0,
+              autoCloseSeconds: null,
             },
-          ],
-          requiresPersonalization: false,
-          grant: "v1.payload.signature",
-          assignment: {
-            assignmentId: "assignment_1",
-            kind: "variant",
-            variantId: "variant_1",
+            asset: null,
           },
+        ],
+        requiresPersonalization: false,
+        grant: "v1.payload.signature",
+        assignment: {
+          assignmentId: "assignment_1",
+          kind: "variant",
+          variantId: "variant_1",
         },
-      ],
-    },
-    signature: "signature",
+      },
+    ],
+  };
+  if (options.secondaryCampaign) {
+    const first = manifest.campaigns[0]!;
+    manifest.campaigns.push({
+      ...structuredClone(first),
+      campaignId: "campaign_2",
+      campaignVersionId: "version_2",
+      priority: 5,
+      assignment: {
+        assignmentId: "assignment_2",
+        kind: "variant",
+        variantId: "variant_1",
+      },
+    });
+  }
+  const signedPayload = Buffer.from(JSON.stringify(manifest)).toString("base64url");
+  return {
+    // The raw manifest is intentionally ignored by the runtime. This keeps the
+    // fixture honest about the verified payload boundary.
+    manifest: options.rawManifest ?? { schemaVersion: 999 },
+    signedPayload,
+    signature: sign(
+      null,
+      Buffer.from(signedPayload, "base64url"),
+      manifestKeyPair.privateKey,
+    ).toString("base64url"),
     keyId: "v1",
     expiresAt,
+  };
+}
+
+function experienceOptions(overrides: Partial<ExperienceOptions> = {}): ExperienceOptions {
+  return {
+    enabled: true,
+    manifestVerificationKeys,
+    ...overrides,
   };
 }
 
@@ -351,12 +675,13 @@ function sourceKey() {
   return `web_${crypto.randomUUID().replace(/-/g, "")}`;
 }
 
-function availableExperienceFixture(): AvailableExperience {
+function availableExperienceFixture(options: { delaySeconds?: number } = {}): QueuedExperience {
   return {
     campaignId: "campaign_1",
     campaignVersionId: "version_1",
     assignmentId: "assignment_1",
     exposureId: "exposure_1",
+    presentationHandle: "exposure_1",
     variantId: "variant_1",
     placement: "modal",
     priority: 10,
@@ -375,9 +700,12 @@ function availableExperienceFixture(): AvailableExperience {
       },
       closeable: true,
       themePreset: "brand",
-      delaySeconds: 0,
+      delaySeconds: options.delaySeconds ?? 0,
       autoCloseSeconds: null,
     },
     assetUrl: "",
+    grant: "v1.payload.signature",
+    defaultLocale: "en",
+    eligibleAt: Date.now(),
   };
 }

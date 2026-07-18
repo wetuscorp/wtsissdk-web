@@ -37,6 +37,28 @@ export function validateOptions(options: WtsClientOptions): Required<
     throw new TypeError("requestTimeoutMs must be an integer between 250 and 30000.");
   }
   const experienceOptions = options.experiences;
+  const manifestVerificationKeys: Record<string, string> = Object.create(null) as Record<
+    string,
+    string
+  >;
+  for (const [keyId, encodedPublicKey] of Object.entries(
+    experienceOptions?.manifestVerificationKeys ?? {},
+  )) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(keyId)) {
+      throw new TypeError("Experience manifest key IDs must contain 1–32 URL-safe characters.");
+    }
+    if (
+      typeof encodedPublicKey !== "string" ||
+      encodedPublicKey.length === 0 ||
+      encodedPublicKey.length > 4_096 ||
+      !/^[A-Za-z0-9+/_-]+={0,2}$/.test(encodedPublicKey)
+    ) {
+      throw new TypeError(
+        `Experience manifest public key ${keyId} must be base64 or base64url SPKI data.`,
+      );
+    }
+    manifestVerificationKeys[keyId] = encodedPublicKey;
+  }
   const normalizeStrings = (
     values: string[] | undefined,
     maximum: number,
@@ -67,6 +89,9 @@ export function validateOptions(options: WtsClientOptions): Required<
     if (!/^[a-z][a-z0-9+.-]{1,31}$/.test(normalized)) {
       throw new TypeError(`Invalid deep-link scheme: ${value}`);
     }
+    if (normalized === "https") {
+      throw new TypeError("Use allowedDeepLinkHosts to allow HTTPS deep links.");
+    }
     return normalized;
   });
   return {
@@ -79,6 +104,7 @@ export function validateOptions(options: WtsClientOptions): Required<
     experiences: {
       enabled: experienceOptions?.enabled ?? false,
       renderMode: experienceOptions?.renderMode ?? "automatic",
+      manifestVerificationKeys,
       allowedInternalRoutes: normalizeStrings(
         experienceOptions?.allowedInternalRoutes,
         100,
@@ -93,7 +119,7 @@ export function validateOptions(options: WtsClientOptions): Required<
         experienceOptions?.allowedDeepLinkHosts,
         20,
         "allowedDeepLinkHosts",
-      ).map((value) => value.toLowerCase()),
+      ).map(normalizeDeepLinkHost),
       allowedDeepLinkSchemes,
       allowedWebOrigins,
     },
@@ -186,6 +212,29 @@ export function normalizePathname(pathname: string): string {
 
 function isLocalhost(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+}
+
+function normalizeDeepLinkHost(value: string): string {
+  const normalized = value.toLowerCase();
+  if (/[/:?#@]/.test(normalized)) {
+    throw new TypeError("Experience deep-link hosts must contain a hostname only.");
+  }
+  try {
+    const parsed = new URL(`https://${normalized}`);
+    if (
+      !parsed.hostname ||
+      parsed.hostname !== normalized ||
+      parsed.port ||
+      parsed.username ||
+      parsed.password
+    ) {
+      throw new TypeError("Experience deep-link hosts must contain a hostname only.");
+    }
+    return parsed.hostname;
+  } catch (error) {
+    if (error instanceof TypeError && error.message.includes("hostname only")) throw error;
+    throw new TypeError("Experience deep-link hosts must contain a valid hostname only.");
+  }
 }
 
 function validateAttributeEntries(entries: Array<[string, unknown]>): void {

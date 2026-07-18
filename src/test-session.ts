@@ -46,6 +46,7 @@ export interface TestSessionRuntimeInput {
   timeoutMs: number;
   debug: boolean;
   getAnalyticsConsent: () => ConsentState;
+  getProfileConsent: () => boolean;
   getExperienceConsent: () => ExperienceConsentState;
   experiencesEnabled: () => boolean;
   transport?: TestSessionTransport;
@@ -220,6 +221,10 @@ export class TestSessionRuntime {
 
   observeExperienceConsent(): void {
     this.record({ type: "consent", outcome: "observed", feature: "experiences" });
+  }
+
+  observeProfileConsent(): void {
+    this.record({ type: "consent", outcome: "observed", feature: "profile" });
   }
 
   observeExperienceInteraction(
@@ -451,6 +456,7 @@ export class TestSessionRuntime {
   private consent() {
     return {
       analytics: this.input.getAnalyticsConsent(),
+      profile: this.input.getProfileConsent(),
       experience: this.input.getExperienceConsent(),
     };
   }
