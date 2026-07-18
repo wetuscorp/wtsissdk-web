@@ -203,6 +203,23 @@ local candidate queue is bounded to five. A session can admit at most two
 overlay presentations (modal, slide-in, or bottom sheet), even if a user
 dismisses one before it qualifies as an impression.
 
+The automatic web renderer accepts only these semantic content tokens. They
+are mapped to a closed SDK-owned colour vocabulary; token values are never
+treated as CSS. An unknown future token safely falls back to the campaign's
+`themePreset` until the SDK adds support for it.
+
+| Content field     | Supported tokens                                       |
+| ----------------- | ------------------------------------------------------ |
+| `backgroundToken` | `surface`, `subtle`, `inverse`, `brand`                |
+| `textToken`       | `primary`, `muted`, `inverse`                          |
+| `accentToken`     | `primary`, `secondary`, `success`, `warning`, `danger` |
+
+`CUSTOM_CALLBACK` has no SDK default action. Its target must be allowlisted
+and an `onExperienceAction` handler must return `true` after the host action
+actually completes. If no handler accepts it, the SDK keeps the Experience
+open, does not record an action interaction, and exposes
+`EXPERIENCE_CALLBACK_UNHANDLED` through `getExperienceDiagnostics()`.
+
 An impression is recorded only after at least half of the experience remains
 visible for one uninterrupted second. Interaction delivery uses the persistent
 bounded queue, UUID idempotency and the same retry policy as product events.
@@ -225,7 +242,10 @@ unsubscribe();
 For manual rendering, report only real lifecycle transitions. Repeating an
 accepted transition returns `{ accepted: true, idempotent: true }`; the handle
 does not expose campaign grants or the exposure identifier in the experience
-payload.
+payload. `onExperienceAvailable` may be `async`; an unhandled synchronous or
+asynchronous renderer failure is contained and reported as
+`EXPERIENCE_MANUAL_HANDLER_FAILED` in diagnostics instead of becoming an
+unhandled promise rejection.
 
 ```ts
 const unsubscribeManual = wts.onExperienceAvailable(async ({ experience, handle }) => {
@@ -248,6 +268,12 @@ const unsubscribeManual = wts.onExperienceAvailable(async ({ experience, handle 
 
 unsubscribeManual();
 ```
+
+The verified manifest expiry also applies to candidates already waiting in the
+local queue. An expired candidate is never rendered. Calling `resetIdentity()`
+clears queued Experience interactions before the SDK creates the next
+anonymous identity, so an old browser user's interactions cannot be delivered
+under the next user's identity.
 
 For a draft Experience device test, copy
 `wts.getExperienceDiagnostics().testDeviceToken` into the dashboard test

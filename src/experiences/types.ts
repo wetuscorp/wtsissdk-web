@@ -117,6 +117,8 @@ export interface QueuedExperience extends WtsExperience {
   grant: string;
   defaultLocale: string;
   eligibleAt: number;
+  /** Epoch milliseconds from the verified signed manifest. Never render after this point. */
+  manifestExpiresAt: number;
   triggerEventId?: string;
 }
 

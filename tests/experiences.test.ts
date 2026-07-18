@@ -4,6 +4,7 @@ import { generateKeyPairSync, sign } from "node:crypto";
 import { WtsClientImpl } from "../src/client";
 import { renderExperience } from "../src/experiences/renderer";
 import { ExperienceRuntime } from "../src/experiences/runtime";
+import { MemoryStorage } from "../src/storage";
 import type { ExperienceManifest, QueuedExperience } from "../src/experiences/types";
 import type {
   BatchResponse,
@@ -319,6 +320,46 @@ describe("Web Experiences", () => {
     expect(available).toHaveBeenCalledTimes(1);
   });
 
+  it("captures asynchronous manual renderer failures without an unhandled rejection", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        if (requestUrl(input).endsWith("/experiences/v1/bootstrap")) {
+          return jsonResponse(bootstrapFixture());
+        }
+        const body = JSON.parse(requestBody(init)) as {
+          interactions: Array<{ clientInteractionId: string }>;
+        };
+        return jsonResponse({
+          accepted: body.interactions.map((item) => item.clientInteractionId),
+          duplicates: [],
+          rejected: [],
+        });
+      }),
+    );
+    const client = new WtsClientImpl(
+      {
+        sourceKey: sourceKey(),
+        consent: "granted",
+        experiences: experienceOptions({ renderMode: "manual" }),
+      },
+      new AnalyticsTransport(),
+    );
+    clients.push(client);
+    client.onExperienceAvailable(async () => {
+      throw new Error("The host renderer failed.");
+    });
+
+    await client.setExperienceConsent("contextual");
+    await client.page("Checkout");
+
+    await vi.waitFor(() => {
+      expect(client.getExperienceDiagnostics().lastErrorCode).toBe(
+        "EXPERIENCE_MANUAL_HANDLER_FAILED",
+      );
+    });
+  });
+
   it("fails closed when a manifest signature cannot be verified", async () => {
     vi.stubGlobal(
       "fetch",
@@ -539,7 +580,7 @@ describe("Web Experiences", () => {
     });
     // No impression is reported; this still counts as a presented overlay.
     await expect(client.dismissExperience(first.handle)).resolves.toMatchObject({ accepted: true });
-    await new Promise((resolve) => setTimeout(resolve, 3_050));
+    await vi.waitFor(() => expect(available).toHaveBeenCalledTimes(2), { timeout: 4_000 });
 
     const second = available.mock.calls[1]![0];
     await expect(client.acknowledgeExperienceRender(second.handle)).resolves.toMatchObject({
@@ -548,7 +589,7 @@ describe("Web Experiences", () => {
     await expect(client.dismissExperience(second.handle)).resolves.toMatchObject({
       accepted: true,
     });
-    await new Promise((resolve) => setTimeout(resolve, 3_050));
+    await new Promise((resolve) => setTimeout(resolve, 3_100));
 
     expect(available).toHaveBeenCalledTimes(2);
     expect(client.getExperienceDiagnostics().queued).toBe(0);
@@ -588,6 +629,149 @@ describe("Web Experiences", () => {
     expect(actionAllowed({ type: "OPEN_DEEP_LINK", target: "javascript:alert(1)" })).toBe(false);
     expect(actionAllowed({ type: "OPEN_DEEP_LINK", target: "data:text/html,unsafe" })).toBe(false);
     expect(actionAllowed({ type: "OPEN_DEEP_LINK", target: "file:///etc/passwd" })).toBe(false);
+    runtime.destroy();
+  });
+
+  it("drops queued Experiences after their verified manifest expires", async () => {
+    const storage = new MemoryStorage();
+    const runtime = new ExperienceRuntime({
+      sourceKey: sourceKey(),
+      collectorOrigin: "https://collect.wts.is",
+      timeoutMs: 2_000,
+      debug: false,
+      options: {
+        enabled: true,
+        renderMode: "automatic",
+        manifestVerificationKeys,
+        allowedInternalRoutes: [],
+        allowedCallbackKeys: [],
+        allowedDeepLinkHosts: [],
+        allowedDeepLinkSchemes: [],
+        allowedWebOrigins: [],
+      },
+      getAnalyticsConsent: () => "granted",
+      getProfileConsent: () => false,
+      getProfileIdentityReady: () => false,
+      getIdentity: () => ({ anonymousId: "anonymous", sessionId: "session" }),
+      getStorage: () => storage,
+      flushIdentity: async () => undefined,
+    });
+    const internals = runtime as unknown as {
+      consent: "contextual";
+      queue: QueuedExperience[];
+    };
+    internals.consent = "contextual";
+    internals.queue = [
+      {
+        ...availableExperienceFixture(),
+        manifestExpiresAt: Date.now() - 1,
+      },
+    ];
+
+    await expect(runtime.presentNext()).resolves.toBe(false);
+    expect(runtime.diagnostics().queued).toBe(0);
+    runtime.destroy();
+  });
+
+  it("clears queued Experience interactions when the anonymous identity resets", async () => {
+    const storage = new MemoryStorage();
+    await storage.enqueueExperience({
+      clientInteractionId: "interaction_1",
+      grant: "v1.payload.signature",
+      campaignId: "campaign_1",
+      campaignVersionId: "version_1",
+      assignmentId: "assignment_1",
+      variantId: "variant_1",
+      exposureId: "exposure_1",
+      type: "eligible",
+      actionId: null,
+      triggerEventId: null,
+      occurredAt: new Date().toISOString(),
+      metadata: { platform: "web", sdkVersion: "test", locale: "en" },
+      failureCode: null,
+    });
+    const runtime = new ExperienceRuntime({
+      sourceKey: sourceKey(),
+      collectorOrigin: "https://collect.wts.is",
+      timeoutMs: 2_000,
+      debug: false,
+      options: {
+        enabled: false,
+        renderMode: "manual",
+        manifestVerificationKeys,
+        allowedInternalRoutes: [],
+        allowedCallbackKeys: [],
+        allowedDeepLinkHosts: [],
+        allowedDeepLinkSchemes: [],
+        allowedWebOrigins: [],
+      },
+      getAnalyticsConsent: () => "granted",
+      getProfileConsent: () => false,
+      getProfileIdentityReady: () => false,
+      getIdentity: () => ({ anonymousId: "anonymous", sessionId: "session" }),
+      getStorage: () => storage,
+      flushIdentity: async () => undefined,
+    });
+
+    await runtime.identityChanged();
+    expect((await storage.load()).experienceQueue).toEqual([]);
+    runtime.destroy();
+  });
+
+  it("requires a host handler to accept a custom callback before recording or closing", async () => {
+    const dismiss = vi.fn();
+    const candidate = availableExperienceFixture();
+    candidate.content.translations.en!.primaryAction = {
+      id: "apply_offer",
+      label: "Apply offer",
+      type: "CUSTOM_CALLBACK",
+      target: "apply_offer",
+    };
+    const runtime = new ExperienceRuntime({
+      sourceKey: sourceKey(),
+      collectorOrigin: "https://collect.wts.is",
+      timeoutMs: 2_000,
+      debug: false,
+      options: {
+        enabled: true,
+        renderMode: "automatic",
+        manifestVerificationKeys,
+        allowedInternalRoutes: [],
+        allowedCallbackKeys: ["apply_offer"],
+        allowedDeepLinkHosts: [],
+        allowedDeepLinkSchemes: [],
+        allowedWebOrigins: [],
+      },
+      getAnalyticsConsent: () => "granted",
+      getProfileConsent: () => false,
+      getProfileIdentityReady: () => false,
+      getIdentity: () => ({ anonymousId: "anonymous", sessionId: "session" }),
+      getStorage: () => undefined,
+      flushIdentity: async () => undefined,
+    });
+    const internals = runtime as unknown as {
+      current: QueuedExperience;
+      renderHandle: { dismiss(reason: "dismissed"): void };
+      handleAction(
+        experience: QueuedExperience,
+        action: NonNullable<QueuedExperience["content"]["translations"]["en"]["primaryAction"]>,
+      ): Promise<void>;
+    };
+    internals.current = candidate;
+    internals.renderHandle = { dismiss };
+    const translation = candidate.content.translations.en;
+    if (translation === undefined || translation.primaryAction === undefined) {
+      throw new Error("Expected fixture to provide a custom callback action");
+    }
+    const action = translation.primaryAction;
+
+    await internals.handleAction(candidate, action);
+    expect(dismiss).not.toHaveBeenCalled();
+    expect(runtime.diagnostics().lastErrorCode).toBe("EXPERIENCE_CALLBACK_UNHANDLED");
+
+    runtime.onAction(() => true);
+    await internals.handleAction(candidate, action);
+    expect(dismiss).toHaveBeenCalledWith("dismissed");
     runtime.destroy();
   });
 
@@ -685,6 +869,11 @@ describe("Web Experiences", () => {
     expect(surface?.getAttribute("aria-modal")).toBe("true");
     expect(root?.querySelector("h2")?.textContent).toBe("Complete your order");
     expect(root?.querySelector("p")?.textContent).toBe("Your cart is ready.");
+    expect(host?.style.getPropertyValue("--wts-experience-background-override")).toBe(
+      "linear-gradient(145deg, #071b34, #0b3260)",
+    );
+    expect(host?.style.getPropertyValue("--wts-experience-text-override")).toBe("#f8fafc");
+    expect(host?.style.getPropertyValue("--wts-experience-accent-override")).toBe("#0b3260");
 
     await vi.advanceTimersByTimeAsync(999);
     expect(onImpression).not.toHaveBeenCalled();
@@ -883,6 +1072,9 @@ function availableExperienceFixture(options: { delaySeconds?: number } = {}): Qu
       },
       closeable: true,
       themePreset: "brand",
+      backgroundToken: "brand",
+      textToken: "inverse",
+      accentToken: "secondary",
       delaySeconds: options.delaySeconds ?? 0,
       autoCloseSeconds: null,
     },
@@ -890,5 +1082,6 @@ function availableExperienceFixture(options: { delaySeconds?: number } = {}): Qu
     grant: "v1.payload.signature",
     defaultLocale: "en",
     eligibleAt: Date.now(),
+    manifestExpiresAt: Date.now() + 10 * 60_000,
   };
 }
