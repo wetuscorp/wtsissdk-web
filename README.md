@@ -2,8 +2,14 @@
 
 Consent-first browser measurement and deterministic wts.is link attribution. The SDK is dependency-free, safe to import during server rendering, and never collects DOM content, form values, URL queries, fragments, advertising identifiers, or fingerprints.
 
-> `0.3.0-alpha.1` adds opt-in wts.is Experiences delivery while retaining
-> Web Protocol V3 analytics, identity and deterministic attribution behavior.
+> `0.3.0-alpha.1` source line adds opt-in wts.is Experiences and SDK Test
+> Session V1 while retaining Web Protocol V3 analytics, identity and
+> deterministic attribution behavior.
+
+> **Release note:** SDK Test & Validate APIs below are source-line APIs. Use
+> them only after the matching web package release has been published. This
+> document does not claim that `0.3.0-alpha.1` is already available from npm
+> or a CDN.
 
 ## Requirements
 
@@ -15,7 +21,7 @@ Consent-first browser measurement and deterministic wts.is link attribution. The
 ## npm installation
 
 ```bash
-npm install @wetusco/wts-web-sdk@next
+npm install @wetusco/wts-web-sdk@<matching-published-version>
 ```
 
 ```ts
@@ -46,8 +52,8 @@ Use a versioned artifact and the SRI value shipped next to it. Do not use an unv
 
 ```html
 <script
-  src="https://cdn.jsdelivr.net/npm/@wetusco/wts-web-sdk@0.3.0-alpha.1/dist/wts-web.iife.min.js"
-  integrity="sha384-uflCoP1PZ6S4YUyrUMWa20BmD8EUOyPFRIV6m9FmFVA/xZXZrk7f0o8IGN1gkqyW"
+  src="https://cdn.jsdelivr.net/npm/@wetusco/wts-web-sdk@<matching-published-version>/dist/wts-web.iife.min.js"
+  integrity="<sha384-from-the-matching-published-release>"
   crossorigin="anonymous"
 ></script>
 <script>
@@ -58,7 +64,11 @@ Use a versioned artifact and the SRI value shipped next to it. Do not use an unv
 </script>
 ```
 
-The IIFE exports `window.WtsWeb`. The release workflow records the exact SHA-384 value in `dist/wts-web.iife.min.js.sri`.
+The IIFE exports `window.WtsWeb`. For a published version, use the exact
+SHA-384 value supplied next to that release in `dist/wts-web.iife.min.js.sri`.
+The SDK Test & Validate methods remain available on that client. When one is
+called, the SDK loads the matching `wts-web-test-session.iife.min.js` companion
+from the same versioned `dist/` directory; deploy both artifacts together.
 
 ## Consent behavior
 
@@ -168,6 +178,62 @@ For an unpublished device test, copy
 panel for the same Web App. The random token is scoped to this SDK instance;
 it contains no user, browser, or profile identifier. Test impressions and
 conversions are excluded from customer analytics and usage.
+
+## SDK Test & Validate
+
+SDK Test & Validate is a dashboard-issued, short-lived validation session. Its
+bounded retry queue is isolated from production page views, events, identity,
+attribution, and Experiences. Do not hardcode, log, or persist a pairing URL
+or token outside the SDK.
+
+The dashboard QR code uses this canonical form:
+
+```text
+https://<web-app-host>/_wts/test/pair?pairing=<dashboard-issued-token>
+```
+
+The Web SDK does not resolve or navigate normal application URLs. Your router
+must recognize the pairing route, join it before normal routing, and retain its
+own normal fallback behavior:
+
+```ts
+function isWtsTestPairing(rawUrl: string): boolean {
+  const url = new URL(rawUrl, window.location.origin);
+  return url.protocol === "https:" && url.pathname === "/_wts/test/pair";
+}
+
+async function onIncomingUrl(rawUrl: string) {
+  if (isWtsTestPairing(rawUrl)) {
+    const joined = await wts.joinTestSession(rawUrl);
+    showSdkTestChecks(joined.checks);
+    return;
+  }
+
+  // The host application owns ordinary routing and its web fallback.
+  routeNormally(rawUrl);
+}
+```
+
+Inspect the isolated session and run only the dashboard-selected plan:
+
+```ts
+const diagnostics = wts.getTestSessionDiagnostics();
+const probes = await wts.runTestSessionProbes();
+
+// This is a test-only manual decision; it never enters the normal Experiences
+// renderer and does not generate production interaction events.
+if (probes.experienceDecision?.outcome === "ready") {
+  await presentTestExperiencePreview(probes.experienceDecision);
+  await wts.reportTestSessionExperienceInteraction("impression");
+}
+```
+
+Report `"action"` only after the corresponding real action in that manual
+preview. It is accepted only after a ready isolated decision; normal Experience
+lifecycle signals are never copied to test transport. Use
+`probeTestSessionUrl(url)` for an event-free resolver check and
+`leaveTestSession()` when the operator finishes. Expiry also clears the
+session.
 
 ## Link attribution
 

@@ -138,9 +138,255 @@ export interface WtsClient {
   presentNextExperience(): Promise<boolean>;
   dismissCurrentExperience(): Promise<boolean>;
   getExperienceDiagnostics(): ExperienceDiagnostics;
+  joinTestSession(pairing: TestSessionPairing): Promise<TestSessionJoinResult>;
+  leaveTestSession(): Promise<{ accepted: boolean }>;
+  probeTestSessionUrl(url: string): Promise<TestSessionProbeResult>;
+  runTestSessionProbes(): Promise<TestSessionProbeRunResult>;
+  reportTestSessionExperienceInteraction(
+    interaction: "impression" | "action",
+  ): Promise<{ accepted: boolean }>;
+  getTestSessionDiagnostics(): TestSessionDiagnostics;
   flush(): Promise<FlushResult>;
   reset(): Promise<void>;
   destroy(): void;
+}
+
+export type TestSessionPairing = string | { pairingToken?: string; pairingCode?: string };
+
+export interface TestSessionCheck {
+  key: string;
+  status: "ready" | "warning" | "blocked";
+  code?: string | null;
+  message?: string;
+}
+
+export type TestSessionIdentityMethod =
+  "identify" | "update_user" | "set_once" | "increment" | "reported_attribution" | "reset_identity";
+
+export interface TestSessionPlan {
+  profile: {
+    selected: boolean;
+    available: boolean;
+    allowedMethods: TestSessionIdentityMethod[];
+  } | null;
+  events: Array<{
+    eventKey: string;
+    properties: Array<{
+      key: string;
+      type: "string" | "number" | "boolean" | "date" | "string_array";
+      required: boolean;
+    }>;
+    revenueEnabled: boolean;
+  }>;
+  deepLink: { selected: boolean; available: boolean; linkId: string | null } | null;
+  experience: {
+    selected: boolean;
+    available: boolean;
+    campaignId: string | null;
+    versionId: string | null;
+  } | null;
+  screen: { selected: true } | null;
+}
+
+export interface TestSessionJoinResult {
+  accepted: boolean;
+  joined: boolean;
+  compatible: boolean;
+  requiredSdkVersion?: string;
+  checks: TestSessionCheck[];
+  sessionId?: string;
+  expiresAt?: string;
+  testProfileExternalUserId?: string;
+  errorCode?: string;
+}
+
+export interface TestSessionDiagnostics {
+  joined: boolean;
+  compatible: boolean;
+  sessionId?: string;
+  expiresAt?: string;
+  requiredSdkVersion?: string;
+  checks: TestSessionCheck[];
+  pendingSignals: number;
+  lastErrorCode?: string;
+}
+
+export interface TestSessionProbeResult {
+  match: boolean;
+  status: "ready" | "blocked";
+  code: string;
+  originalUrl: string;
+  fallbackUrl: string;
+  link: {
+    id: string;
+    path: string;
+    parameters: Record<string, Scalar>;
+  } | null;
+}
+
+export type TestSessionExperienceContext =
+  | {
+      type: "page_view";
+      pathname: string;
+      pageName?: string;
+      locale: string;
+    }
+  | {
+      type: "screen_view";
+      screenName: string;
+      locale: string;
+    }
+  | {
+      type: "custom_event";
+      eventKey: string;
+      properties?: EventProperties;
+      locale: string;
+    };
+
+export interface TestSessionExperienceDecision {
+  outcome: "ready" | "holdout" | "not_eligible" | "blocked";
+  reason: string | null;
+  testGrant: { fixtureId: string; expiresAt: string } | null;
+  decision: {
+    campaignId: string;
+    campaignVersionId: string;
+    placement: string;
+    defaultLocale: string;
+    variant: {
+      id: string;
+      key: string;
+      content: unknown;
+      asset: { url: string } | null;
+    } | null;
+  } | null;
+}
+
+export interface TestSessionProbeRunResult {
+  accepted: boolean;
+  emitted: Array<"identity" | "event" | "screen" | "experiences">;
+  skipped: Array<"identity" | "event" | "screen" | "experiences">;
+  pendingSignals: number;
+  /**
+   * An isolated test-only decision. It is never added to the production
+   * Experiences runtime or rendered automatically.
+   */
+  experienceDecision?: TestSessionExperienceDecision;
+}
+
+export interface TestSessionSignal {
+  clientSignalId: string;
+  type:
+    | "sdk_connected"
+    | "consent"
+    | "deep_link_resolved"
+    | "event_recorded"
+    | "identity_recorded"
+    | "screen_recorded"
+    | "experience_impression"
+    | "experience_action"
+    | "probe_completed"
+    | "sdk_left";
+  outcome: "passed" | "failed" | "observed" | "blocked";
+  occurredAt: string;
+  method?: string;
+  eventKey?: string;
+  screenName?: string;
+  propertyKeys?: string[];
+  propertyTypes?: Record<string, "string" | "number" | "boolean" | "date" | "string_array">;
+  /** A descriptor only; no monetary value is ever sent through test telemetry. */
+  revenue?: { present: true; currency: string };
+  resultCode?: string;
+  feature?: string;
+}
+
+export interface TestSessionTransport {
+  pair(
+    sourceKey: string,
+    input: {
+      schemaVersion: 1;
+      pairingToken?: string;
+      pairingCode?: string;
+      metadata: TestSessionMetadata;
+    },
+  ): Promise<{
+    session: { id: string; status: string; expiresAt: string };
+    participant: {
+      id: string;
+      sourceId: string;
+      sourceType: "mobile_app" | "web_app";
+      status: "paired";
+    };
+    sessionToken: string;
+    testProfile: { externalUserId: string };
+    requiredSdkVersion: string;
+    testPlan: TestSessionPlan;
+  }>;
+  handshake(
+    sourceKey: string,
+    input: {
+      schemaVersion: 1;
+      participantId: string;
+      sessionToken: string;
+      metadata: TestSessionMetadata;
+      capabilities: {
+        deeplink: boolean;
+        identity: boolean;
+        screen: boolean;
+        experiences: boolean;
+        offlineQueue: boolean;
+      };
+      consent: {
+        analytics: ConsentState;
+        profile?: boolean;
+        experience?: ExperienceConsentState;
+      };
+    },
+  ): Promise<{
+    accepted: boolean;
+    compatible: boolean;
+    requiredSdkVersion: string;
+    checks: TestSessionCheck[];
+    testPlan: TestSessionPlan;
+  }>;
+  signals(
+    sourceKey: string,
+    input: {
+      schemaVersion: 1;
+      participantId: string;
+      sessionToken: string;
+      signals: TestSessionSignal[];
+    },
+  ): Promise<{
+    accepted: string[];
+    duplicates: string[];
+    rejected: Array<{ clientSignalId: string; code: string; message: string; retryable: boolean }>;
+  }>;
+  resolve(
+    sourceKey: string,
+    input: { schemaVersion: 1; participantId: string; sessionToken: string; url: string },
+  ): Promise<TestSessionProbeResult>;
+  decideExperience(
+    sourceKey: string,
+    input: {
+      schemaVersion: 1;
+      participantId: string;
+      sessionToken: string;
+      context: TestSessionExperienceContext;
+    },
+  ): Promise<TestSessionExperienceDecision>;
+  leave(
+    sourceKey: string,
+    input: { schemaVersion: 1; participantId: string; sessionToken: string },
+  ): Promise<{ accepted: boolean }>;
+}
+
+export interface TestSessionMetadata {
+  platform: "web" | "ios" | "android";
+  sdkFamily: "web" | "swift" | "android" | "flutter" | "react_native";
+  sdkVersion: string;
+  appVersion?: string;
+  osVersion?: string;
+  locale: string;
 }
 
 export interface ExperienceContext {

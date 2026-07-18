@@ -40,6 +40,7 @@ interface ExperienceRuntimeDependencies {
   getIdentity(): Identity | undefined;
   getStorage(): StorageAdapter | undefined;
   flushIdentity(): Promise<unknown>;
+  onInteraction?(type: ExperienceInteraction["type"]): void;
 }
 
 const MANIFEST_CACHE_MS = 5 * 60_000;
@@ -626,6 +627,7 @@ export class ExperienceRuntime {
     const storage = this.dependencies.getStorage();
     if (!storage) return;
     await storage.enqueueExperience(interaction);
+    this.dependencies.onInteraction?.(interaction.type);
     queueMicrotask(() => void this.flushInteractions());
   }
 

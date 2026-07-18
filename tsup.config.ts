@@ -1,4 +1,9 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "tsup";
+
+const iifeTestSessionLoader = fileURLToPath(
+  new URL("./src/test-session-loader.iife.ts", import.meta.url),
+);
 
 export default defineConfig([
   {
@@ -27,6 +32,23 @@ export default defineConfig([
     entry: { "wts-web": "src/iife.ts" },
     format: ["iife"],
     globalName: "WtsWebBundle",
+    outExtension: () => ({ js: ".iife.min.js" }),
+    sourcemap: true,
+    minify: true,
+    target: "es2020",
+    splitting: false,
+    treeshake: true,
+    esbuildOptions(options) {
+      options.alias = {
+        ...options.alias,
+        "@wts/test-session-loader": iifeTestSessionLoader,
+      };
+    },
+  },
+  {
+    entry: { "wts-web-test-session": "src/test-session-iife.ts" },
+    format: ["iife"],
+    globalName: "WtsWebTestSessionBundle",
     outExtension: () => ({ js: ".iife.min.js" }),
     sourcemap: true,
     minify: true,
