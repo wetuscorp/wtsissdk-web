@@ -24,6 +24,14 @@ export interface WtsClientOptions {
 export interface ExperienceOptions {
   enabled: boolean;
   renderMode?: ExperienceRenderMode;
+  /**
+   * Trusted Ed25519 public keys indexed by the signed manifest `kid`.
+   *
+   * Each value is an SPKI DER public key encoded as base64 or base64url. These
+   * are public verification keys, never private signing keys. When no matching
+   * key is configured, the SDK fails closed and does not present Experiences.
+   */
+  manifestVerificationKeys?: Record<string, string>;
   allowedInternalRoutes?: string[];
   allowedCallbackKeys?: string[];
   allowedDeepLinkHosts?: string[];
@@ -67,20 +75,37 @@ export interface ExperienceContent {
   autoCloseSeconds: number | null;
 }
 
-export interface AvailableExperience {
+/**
+ * Content and delivery metadata for an Experience that the SDK has accepted.
+ *
+ * This object intentionally excludes the exposure identifier. Manual renderers
+ * receive that identifier only through the opaque presentation handle.
+ */
+export interface WtsExperience {
   campaignId: string;
   campaignVersionId: string;
   assignmentId: string | null;
   variantId: string | null;
-  exposureId: string;
   placement: ExperiencePlacement;
   priority: number;
   content: ExperienceContent;
   assetUrl?: string;
 }
 
+/** @deprecated Use {@link WtsExperience}. */
+export type AvailableExperience = WtsExperience;
+
+/**
+ * Delivered only when `renderMode` is `manual`. `handle` is opaque and maps to
+ * the single exposure being presented; do not inspect, persist, or derive it.
+ */
+export interface WtsExperienceManualPresentation {
+  experience: WtsExperience;
+  handle: string;
+}
+
 export interface ExperienceActionEvent {
-  experience: AvailableExperience;
+  experience: WtsExperience;
   action: ExperienceAction;
   handled: boolean;
 }
@@ -101,13 +126,41 @@ export interface ExperienceDiagnostics {
 export interface ExperienceConsentResult {
   accepted: boolean;
   reason?:
-    "feature_disabled" | "analytics_consent_required" | "profile_consent_required" | "destroyed";
+    | "feature_disabled"
+    | "analytics_consent_required"
+    | "profile_consent_required"
+    | "profile_identity_required"
+    | "destroyed";
+}
+
+export interface ExperiencePresentationResult {
+  accepted: boolean;
+  /** Whether this repeats an already accepted lifecycle transition. */
+  idempotent: boolean;
+  code?:
+    | "feature_disabled"
+    | "manual_mode_required"
+    | "consent_required"
+    | "presentation_not_found"
+    | "presentation_not_presenting"
+    | "session_overlay_limit_reached"
+    | "already_reported"
+    | "invalid_action"
+    | "invalid_failure_code"
+    | "destroyed";
+}
+
+export interface ExperienceDismissal {
+  /** Defaults to a user dismissal. */
+  reason?: "dismissed" | "auto_closed";
+  /** Optional stable, uppercase diagnostic code supplied by a host renderer. */
+  failureCode?: string;
 }
 
 export type ExperienceActionHandler = (
   event: ExperienceActionEvent,
 ) => void | boolean | Promise<void | boolean>;
-export type ExperienceAvailableHandler = (experience: AvailableExperience) => void;
+export type ExperienceAvailableHandler = (presentation: WtsExperienceManualPresentation) => void;
 
 export interface OperationResult {
   accepted: boolean;
@@ -122,6 +175,12 @@ export interface FlushResult {
 
 export interface WtsClient {
   setConsent(consent: "granted" | "denied"): Promise<void>;
+  /**
+   * Records the host application's current profile-consent decision in memory.
+   * The SDK never persists consent; call this on each page load before using
+   * personalized Experiences.
+   */
+  setProfileConsent(granted: boolean): Promise<void>;
   page(name?: string): Promise<OperationResult>;
   track(
     eventKey: string,
@@ -135,6 +194,18 @@ export interface WtsClient {
   setExperienceConsent(consent: ExperienceConsentState): Promise<ExperienceConsentResult>;
   onExperienceAction(handler: ExperienceActionHandler): () => void;
   onExperienceAvailable(handler: ExperienceAvailableHandler): () => void;
+  acknowledgeExperienceRender(handle: string): Promise<ExperiencePresentationResult>;
+  acknowledgeExperienceImpression(handle: string): Promise<ExperiencePresentationResult>;
+  reportExperienceAction(handle: string, actionId: string): Promise<ExperiencePresentationResult>;
+  dismissExperience(
+    handle: string,
+    outcome?: ExperienceDismissal,
+  ): Promise<ExperiencePresentationResult>;
+  /** @deprecated Use dismissExperience(handle, { failureCode }) instead. */
+  failExperiencePresentation(
+    handle: string,
+    failureCode: string,
+  ): Promise<ExperiencePresentationResult>;
   presentNextExperience(): Promise<boolean>;
   dismissCurrentExperience(): Promise<boolean>;
   getExperienceDiagnostics(): ExperienceDiagnostics;

@@ -1,11 +1,11 @@
 import type {
-  AvailableExperience,
   EventProperties,
   ExperienceContent,
   ExperienceContext,
   ExperiencePlacement,
   StoredExperienceInteraction,
   Scalar,
+  WtsExperience,
 } from "../types";
 
 export interface ExperienceMetadata {
@@ -55,6 +55,8 @@ export interface ManifestCampaign {
 export interface ExperienceManifest {
   schemaVersion: 1;
   sourceId: string;
+  /** Public source key, signed to prevent cross-source manifest replay. */
+  sourceKey: string;
   sourceManifestVersion: number;
   environment?: "production" | "staging" | "development";
   generatedAt: string;
@@ -63,9 +65,14 @@ export interface ExperienceManifest {
 }
 
 export interface BootstrapResponse {
-  manifest: ExperienceManifest;
+  /** Ignored by the SDK. Only `signedPayload` is trusted after verification. */
+  manifest: unknown;
+  /** Base64url UTF-8 JSON. It must be signature-verified before parsing. */
+  signedPayload: string;
   signature: string;
+  /** Signing key id (the `kid` used to look up the configured public key). */
   keyId: string;
+  /** Ignored by the SDK; expiry is taken from the verified payload. */
   expiresAt: string;
 }
 
@@ -103,7 +110,10 @@ export type TargetNode =
   | { kind: "any"; conditions: TargetNode[] }
   | { kind: "not"; condition: TargetNode };
 
-export interface QueuedExperience extends AvailableExperience {
+export interface QueuedExperience extends WtsExperience {
+  /** Local opaque reference. It is the only public representation of exposureId. */
+  presentationHandle: string;
+  exposureId: string;
   grant: string;
   defaultLocale: string;
   eligibleAt: number;

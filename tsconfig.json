@@ -6,6 +6,7 @@
     "baseUrl": ".",
     "paths": {
       "@wetusco/wts-web-sdk": ["./src/index.ts"],
+      "@wts/experience-loader": ["./src/experiences/loader.ts"],
       "@wts/test-session-loader": ["./src/test-session-loader.ts"]
     },
     "lib": ["ES2020", "DOM", "DOM.Iterable"],

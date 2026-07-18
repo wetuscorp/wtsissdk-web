@@ -43,7 +43,7 @@ class FakeTestSessionTransport implements TestSessionTransport {
       },
       sessionToken: "a".repeat(32),
       testProfile: { externalUserId: "test_profile_123" },
-      requiredSdkVersion: "0.3.0-alpha.1",
+      requiredSdkVersion: "0.4.0-alpha.1",
       testPlan: testPlan(),
     };
   }
@@ -53,7 +53,7 @@ class FakeTestSessionTransport implements TestSessionTransport {
     return {
       accepted: true,
       compatible: this.compatible,
-      requiredSdkVersion: "0.3.0-alpha.1",
+      requiredSdkVersion: "0.4.0-alpha.1",
       checks: [
         {
           key: "sdk_version",

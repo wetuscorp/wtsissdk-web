@@ -1,5 +1,6 @@
 import { ATTRIBUTION_QUERY_KEY, MAX_BATCH_BYTES, MAX_BATCH_EVENTS, SDK_VERSION } from "./constants";
-import { ExperienceRuntime } from "./experiences/runtime";
+import { ExperienceFacade } from "./experiences/facade";
+import type { ExperienceRuntimeDependencies } from "./experiences/runtime";
 import { MultiTabLock } from "./multitab-lock";
 import {
   byteLength,
@@ -24,8 +25,11 @@ import type {
   ExperienceConsentResult,
   ExperienceConsentState,
   ExperienceDiagnostics,
+  ExperienceDismissal,
+  ExperiencePresentationResult,
   FlushResult,
   Identity,
+  IdentityBatchResponse,
   IdentityMutation,
   OperationResult,
   ReportedAttribution,
@@ -61,6 +65,9 @@ const ATTRIBUTION_CONTEXT_TTL_MS = 7 * 24 * 60 * 60_000;
 
 export class WtsClientImpl implements WtsClient {
   private consent: ConsentState;
+  private profileConsentGranted = false;
+  /** Set only after the collector accepted an identify mutation in this runtime. */
+  private profileIdentityReady = false;
   private storage: StorageAdapter | undefined;
   private identity: Identity | undefined;
   private attributionContextId: string | undefined;
@@ -77,7 +84,7 @@ export class WtsClientImpl implements WtsClient {
   private readonly options: ResolvedOptions;
   private readonly transport: Transport;
   private readonly lock: MultiTabLock;
-  private readonly experiences: ExperienceRuntime;
+  private readonly experiences: ExperienceFacade;
   private testSession: TestSessionRuntime | undefined;
   private testSessionLoading: Promise<TestSessionRuntime> | undefined;
   private readonly testSessionInput: TestSessionRuntimeInput;
@@ -92,13 +99,15 @@ export class WtsClientImpl implements WtsClient {
     this.transport =
       transport ?? new HttpTransport(this.options.collectorOrigin, this.options.requestTimeoutMs);
     this.lock = new MultiTabLock(`flush-${this.options.sourceKey}`);
-    this.experiences = new ExperienceRuntime({
+    const experienceDependencies: ExperienceRuntimeDependencies = {
       sourceKey: this.options.sourceKey,
       collectorOrigin: this.options.collectorOrigin,
       timeoutMs: this.options.requestTimeoutMs,
       debug: this.options.debug,
       options: this.options.experiences,
       getAnalyticsConsent: () => this.consent,
+      getProfileConsent: () => this.profileConsentGranted,
+      getProfileIdentityReady: () => this.profileIdentityReady,
       getIdentity: () => this.identity,
       getStorage: () => this.storage,
       flushIdentity: async () => this.lock.run(async () => this.flushExclusive(false)),
@@ -106,13 +115,15 @@ export class WtsClientImpl implements WtsClient {
         this.observeTestSession((session) => {
           session.observeExperienceInteraction(type);
         }),
-    });
+    };
+    this.experiences = new ExperienceFacade(experienceDependencies);
     this.testSessionInput = {
       sourceKey: this.options.sourceKey,
       collectorOrigin: this.options.collectorOrigin,
       timeoutMs: this.options.requestTimeoutMs,
       debug: this.options.debug,
       getAnalyticsConsent: () => this.consent,
+      getProfileConsent: () => this.profileConsentGranted,
       getExperienceConsent: () => this.experiences.diagnostics().consent,
       experiencesEnabled: () => this.options.experiences.enabled,
       ...(testSessionTransport ? { transport: testSessionTransport } : {}),
@@ -145,6 +156,8 @@ export class WtsClientImpl implements WtsClient {
       }
       this.storage = undefined;
       this.identity = undefined;
+      this.profileConsentGranted = false;
+      this.profileIdentityReady = false;
       this.attributionContextId = undefined;
       this.attributionContextExpiresAt = undefined;
       this.attributionToken = undefined;
@@ -187,6 +200,13 @@ export class WtsClientImpl implements WtsClient {
       triggerEventId: event.clientEventId,
     });
     return { accepted: true, clientEventId: event.clientEventId };
+  }
+
+  async setProfileConsent(granted: boolean): Promise<void> {
+    if (this.destroyed) return;
+    this.profileConsentGranted = granted;
+    if (!granted) await this.experiences.profileConsentChanged();
+    this.observeTestSession((session) => session.observeProfileConsent());
   }
 
   async track(
@@ -260,6 +280,7 @@ export class WtsClientImpl implements WtsClient {
     const result = await this.enqueueIdentityMutation({ type: "reset_identity" });
     if (!this.storage) return result;
     this.identity = { anonymousId: createUuid(), sessionId: createUuid() };
+    this.profileIdentityReady = false;
     this.bootstrapClientEventId = createUuid();
     this.attributionContextId = undefined;
     this.attributionContextExpiresAt = undefined;
@@ -289,6 +310,33 @@ export class WtsClientImpl implements WtsClient {
 
   onExperienceAvailable(handler: ExperienceAvailableHandler): () => void {
     return this.experiences.onAvailable(handler);
+  }
+
+  acknowledgeExperienceRender(handle: string): Promise<ExperiencePresentationResult> {
+    return this.experiences.acknowledgeExperienceRender(handle);
+  }
+
+  acknowledgeExperienceImpression(handle: string): Promise<ExperiencePresentationResult> {
+    return this.experiences.acknowledgeExperienceImpression(handle);
+  }
+
+  reportExperienceAction(handle: string, actionId: string): Promise<ExperiencePresentationResult> {
+    return this.experiences.reportExperienceAction(handle, actionId);
+  }
+
+  dismissExperience(
+    handle: string,
+    outcome?: ExperienceDismissal,
+  ): Promise<ExperiencePresentationResult> {
+    return this.experiences.dismissExperience(handle, outcome);
+  }
+
+  /** @deprecated Use dismissExperience(handle, { failureCode }) instead. */
+  failExperiencePresentation(
+    handle: string,
+    failureCode: string,
+  ): Promise<ExperiencePresentationResult> {
+    return this.experiences.failExperiencePresentation(handle, failureCode);
   }
 
   presentNextExperience(): Promise<boolean> {
@@ -565,6 +613,7 @@ export class WtsClientImpl implements WtsClient {
               ...permanentlyRejected,
             ]),
           );
+          this.applyAcceptedIdentityBindings(identityBatch, identityResponse);
           if (permanentlyRejected.length > 0) {
             safeWarn(
               this.options.debug,
@@ -692,6 +741,18 @@ export class WtsClientImpl implements WtsClient {
     await this.ensureReady();
     unavailable = this.unavailableResult();
     return unavailable;
+  }
+
+  private applyAcceptedIdentityBindings(
+    mutations: IdentityMutation[],
+    response: IdentityBatchResponse,
+  ): void {
+    const accepted = new Set([...response.accepted, ...response.duplicates]);
+    for (const mutation of mutations) {
+      if (!accepted.has(mutation.clientMutationId)) continue;
+      if (mutation.type === "identify") this.profileIdentityReady = true;
+      if (mutation.type === "reset_identity") this.profileIdentityReady = false;
+    }
   }
 
   private async enqueueIdentityMutation(

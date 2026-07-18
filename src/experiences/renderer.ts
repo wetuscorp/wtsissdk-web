@@ -1,7 +1,9 @@
-import type { AvailableExperience, ExperienceAction, ExperienceLocalizedContent } from "../types";
+import type { ExperienceAction, ExperienceLocalizedContent } from "../types";
+import type { QueuedExperience } from "./types";
 
 export interface RenderCallbacks {
   locale: string;
+  signal?: AbortSignal;
   onAction(action: ExperienceAction): void;
   onDismiss(reason: "dismissed" | "auto_closed"): void;
   onImpression(): void;
@@ -12,10 +14,11 @@ export interface RenderHandle {
 }
 
 export async function renderExperience(
-  experience: AvailableExperience,
+  experience: QueuedExperience,
   callbacks: RenderCallbacks,
 ): Promise<RenderHandle> {
   if (typeof document === "undefined") throw new Error("DOCUMENT_UNAVAILABLE");
+  if (callbacks.signal?.aborted) throw abortError();
   const translated = selectTranslation(experience.content.translations, callbacks.locale);
   if (!translated) throw new Error("CONTENT_LOCALE_UNAVAILABLE");
 
@@ -109,12 +112,13 @@ export async function renderExperience(
   const delay = experience.content.delaySeconds * 1_000;
   if (delay > 0) {
     host.style.visibility = "hidden";
-    await new Promise<void>((resolve) => {
-      setTimeout(() => {
-        if (!closed) host.style.visibility = "visible";
-        resolve();
-      }, delay);
-    });
+    await waitForDelay(delay, callbacks.signal, () => close("dismissed", false));
+    if (closed || callbacks.signal?.aborted) throw abortError();
+    host.style.visibility = "visible";
+  }
+  if (closed || callbacks.signal?.aborted) {
+    close("dismissed", false);
+    throw abortError();
   }
   if (observer) observer.observe(surface);
   else {
@@ -135,9 +139,36 @@ export async function renderExperience(
   return { dismiss: close };
 }
 
+function waitForDelay(delay: number, signal: AbortSignal | undefined, onAbort: () => void) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      onAbort();
+      reject(abortError());
+      return;
+    }
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, delay);
+    const abort = () => {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
+      onAbort();
+      reject(abortError());
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function abortError(): Error {
+  const error = new Error("EXPERIENCE_RENDER_ABORTED");
+  error.name = "AbortError";
+  return error;
+}
+
 function appendContent(
   surface: HTMLElement,
-  experience: AvailableExperience,
+  experience: QueuedExperience,
   content: ExperienceLocalizedContent,
   callbacks: RenderCallbacks,
 ) {

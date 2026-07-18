@@ -16,8 +16,14 @@ if (gzipBytes > 15 * 1024) throw new Error(`IIFE gzip budget exceeded: ${gzipByt
 const testSessionIife = await readFile(
   new URL("../dist/wts-web-test-session.iife.min.js", import.meta.url),
 );
+const experiencesIife = await readFile(
+  new URL("../dist/wts-web-experiences.iife.min.js", import.meta.url),
+);
 if (!iife.includes("wts-web-test-session.iife.min.js")) {
   throw new Error("The primary IIFE must retain the lazy SDK Test & Validate loader.");
+}
+if (!iife.includes("wts-web-experiences.iife.min.js")) {
+  throw new Error("The primary IIFE must retain the lazy Experiences loader.");
 }
 for (const method of ["joinTestSession", "leaveTestSession", "getTestSessionDiagnostics"]) {
   if (!iife.includes(method)) {
@@ -27,7 +33,9 @@ for (const method of ["joinTestSession", "leaveTestSession", "getTestSessionDiag
 if (!testSessionIife.includes("__wtsWebTestSessionFactory")) {
   throw new Error("The SDK Test & Validate companion IIFE does not expose its runtime factory.");
 }
-await verifyIifeTestSessionFacade(iife, testSessionIife);
+if (!experiencesIife.includes("__wtsWebExperiencesFactory")) {
+  throw new Error("The Experiences companion IIFE does not expose its runtime factory.");
+}
 
 const sri = `sha384-${createHash("sha384").update(iife).digest("base64")}`;
 await writeFile(new URL("../dist/wts-web.iife.min.js.sri", import.meta.url), `${sri}\n`, "utf8");
@@ -37,6 +45,17 @@ await writeFile(
   `${testSessionSri}\n`,
   "utf8",
 );
+const experiencesSri = `sha384-${createHash("sha384").update(experiencesIife).digest("base64")}`;
+await writeFile(
+  new URL("../dist/wts-web-experiences.iife.min.js.sri", import.meta.url),
+  `${experiencesSri}\n`,
+  "utf8",
+);
+if (!iife.includes("wtsWebExperiencesIntegrity") || !iife.includes("integrity")) {
+  throw new Error("The primary IIFE must pass a pinned Experiences SRI value to its loader.");
+}
+await verifyIifeTestSessionFacade(iife, testSessionIife);
+await verifyIifeExperiencesIntegrity(iife, experiencesIife, experiencesSri);
 
 const esm = await import(new URL("../dist/index.js", import.meta.url).href);
 const cjs = createRequire(import.meta.url)("../dist/index.cjs");
@@ -83,7 +102,7 @@ async function verifyIifeTestSessionFacade(iifeSource, testSessionSource) {
         },
         sessionToken: "t".repeat(32),
         testProfile: { externalUserId: "test_profile_package" },
-        requiredSdkVersion: "0.3.0-alpha.1",
+        requiredSdkVersion: "0.4.0-alpha.1",
         testPlan: emptyTestPlan(),
       });
     }
@@ -91,7 +110,7 @@ async function verifyIifeTestSessionFacade(iifeSource, testSessionSource) {
       return jsonResponse({
         accepted: true,
         compatible: true,
-        requiredSdkVersion: "0.3.0-alpha.1",
+        requiredSdkVersion: "0.4.0-alpha.1",
         checks: [],
         testPlan: emptyTestPlan(),
       });
@@ -141,6 +160,100 @@ async function verifyIifeTestSessionFacade(iifeSource, testSessionSource) {
     );
   }
   await client.leaveTestSession();
+  client.destroy();
+}
+
+async function verifyIifeExperiencesIntegrity(iifeSource, experienceSource, experienceSri) {
+  let injectedExperienceScript;
+  const unverifiedFactory = {
+    create() {
+      throw new Error("An unverified Experiences companion must never run.");
+    },
+  };
+  const window = {
+    addEventListener() {},
+    removeEventListener() {},
+    __wtsWebExperiencesFactory: unverifiedFactory,
+  };
+  const document = {
+    currentScript: {
+      src: "https://cdn.example.test/wts-web.iife.min.js",
+      dataset: { wtsWebExperiencesIntegrity: experienceSri },
+    },
+    scripts: [],
+    addEventListener() {},
+    removeEventListener() {},
+    createElement() {
+      return { dataset: {} };
+    },
+    head: {
+      append(script) {
+        if (!script.dataset.wtsWebExperiences) {
+          throw new Error("Unexpected non-Experience companion injection.");
+        }
+        injectedExperienceScript = script;
+        document.currentScript = script;
+        vm.runInContext(experienceSource.toString(), context);
+        script.onload?.();
+      },
+    },
+  };
+  const fetch = async (url) => {
+    const path = new URL(url).pathname;
+    if (path === "/v3/bootstrap") {
+      return jsonResponse({ attributionContextId: null, serverTime: futureIso() });
+    }
+    if (path === "/experiences/v1/bootstrap") {
+      // The loader is the subject of this check. An untrusted response still
+      // exercises fail-closed manifest handling after the SRI-checked load.
+      return jsonResponse({
+        manifest: {},
+        signedPayload: "e30",
+        signature: "invalid",
+        keyId: "v1",
+        expiresAt: futureIso(),
+      });
+    }
+    throw new Error(`Unexpected IIFE Experience request: ${path}`);
+  };
+  const sandbox = {
+    AbortController,
+    URL,
+    TextDecoder,
+    TextEncoder,
+    atob,
+    clearTimeout,
+    console,
+    crypto: globalThis.crypto,
+    document,
+    fetch,
+    queueMicrotask,
+    setTimeout,
+    window,
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+  vm.runInContext(iifeSource.toString(), context);
+
+  const client = window.WtsWeb.createWtsClient({
+    sourceKey: "web_package_experience_test",
+    consent: "pending",
+    experiences: { enabled: true, renderMode: "manual" },
+  });
+  await client.setConsent("granted");
+  await client.setExperienceConsent("contextual");
+  if (!injectedExperienceScript) {
+    throw new Error("The primary IIFE did not load the Experiences companion when enabled.");
+  }
+  if (
+    injectedExperienceScript.integrity !== experienceSri ||
+    injectedExperienceScript.crossOrigin !== "anonymous"
+  ) {
+    throw new Error("The Experiences companion was not injected with the exact SRI pin.");
+  }
+  if (window.__wtsWebExperiencesFactory === unverifiedFactory) {
+    throw new Error("The primary IIFE trusted an unverified Experiences companion factory.");
+  }
   client.destroy();
 }
 

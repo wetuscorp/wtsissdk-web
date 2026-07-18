@@ -1,6 +1,6 @@
 {
   "name": "@wetusco/wts-web-sdk",
-  "version": "0.3.0-alpha.1",
+  "version": "0.4.0-alpha.1",
   "description": "Consent-first web analytics, identity, attribution and safe in-app Experiences for wts.is.",
   "license": "Apache-2.0",
   "author": "Wetus <info@wetus.co>",
