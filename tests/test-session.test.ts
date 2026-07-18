@@ -192,6 +192,43 @@ describe("SDK Test & Validate session", () => {
     expect(testTransport.signalBatches).toEqual([]);
   });
 
+  it("restores a persisted test session only after analytics consent is granted", async () => {
+    const sourceKey = uniqueSource();
+    const firstTransport = new FakeTestSessionTransport();
+    const firstClient = new WtsClientImpl(
+      { sourceKey, consent: "granted" },
+      new AnalyticsTransport(),
+      firstTransport,
+    );
+    clients.push(firstClient);
+    await firstClient.joinTestSession("A2B3C4D5E6F7G8H9");
+    firstClient.destroy();
+
+    const restoredTransport = new FakeTestSessionTransport();
+    const getItem = vi.spyOn(sessionStorage, "getItem");
+    const restoredClient = new WtsClientImpl(
+      { sourceKey, consent: "pending" },
+      new AnalyticsTransport(),
+      restoredTransport,
+    );
+    clients.push(restoredClient);
+
+    expect(getItem).not.toHaveBeenCalled();
+    await restoredClient.track("checkout_started", { cart_total: 749.9 });
+    expect(restoredTransport.signalBatches).toEqual([]);
+
+    await restoredClient.setConsent("granted");
+    await vi.waitFor(() =>
+      expect(restoredClient.getTestSessionDiagnostics()).toMatchObject({ joined: true }),
+    );
+    await restoredClient.track("checkout_started", { cart_total: 749.9 });
+    await restoredClient.flush();
+    await vi.waitFor(() =>
+      expect(restoredTransport.signalBatches.flat().length).toBeGreaterThan(0),
+    );
+    await restoredClient.leaveTestSession();
+  });
+
   it("runs a session-authenticated resolve probe without persisting its URL", async () => {
     const testTransport = new FakeTestSessionTransport();
     const client = new WtsClientImpl(
