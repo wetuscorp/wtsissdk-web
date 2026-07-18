@@ -2,6 +2,22 @@
 
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and Semantic Versioning.
 
+> The `0.3.0-alpha.1` source line below is not an npm publication claim.
+> Consume SDK Test & Validate only from its matching published web package
+> release.
+
+## 0.3.0-alpha.1
+
+- Added explicitly opt-in wts.is Experiences with contextual and personalized consent.
+- Added contextual manifest evaluation and personalized decision delivery.
+- Added automatic Shadow DOM rendering and manual presentation mode.
+- Added safe route, deep-link, web-origin and callback allowlists.
+- Added visibility-qualified impressions, a bounded candidate queue and session safety caps.
+- Added durable idempotent interaction delivery with retry and consent cleanup.
+- Kept the renderer in a dynamic ESM chunk; the package remains below the 15 KiB gzip budget.
+- Added opt-in SDK Test Session V1 pairing, diagnostics, isolated probes, and
+  explicit manual test Experience impression/action reporting.
+
 ## 0.2.0-alpha.1
 
 - Added consent-gated `identify`, `updateUser`, `setReportedAttribution`, and `resetIdentity`.

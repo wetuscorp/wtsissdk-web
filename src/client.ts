@@ -1,4 +1,5 @@
 import { ATTRIBUTION_QUERY_KEY, MAX_BATCH_BYTES, MAX_BATCH_EVENTS, SDK_VERSION } from "./constants";
+import { ExperienceRuntime } from "./experiences/runtime";
 import { MultiTabLock } from "./multitab-lock";
 import {
   byteLength,
@@ -12,10 +13,17 @@ import {
 } from "./runtime";
 import { installSpaTracker } from "./spa-tracker";
 import { createStorage, deleteStorage, MemoryStorage } from "./storage";
+import { loadTestSessionRuntime } from "@wts/test-session-loader";
+import { hasPersistedTestSession } from "./test-session-presence";
 import { HttpTransport, TransportError } from "./transport";
 import type {
   ConsentState,
   EventProperties,
+  ExperienceActionHandler,
+  ExperienceAvailableHandler,
+  ExperienceConsentResult,
+  ExperienceConsentState,
+  ExperienceDiagnostics,
   FlushResult,
   Identity,
   IdentityMutation,
@@ -23,6 +31,13 @@ import type {
   ReportedAttribution,
   Revenue,
   StorageAdapter,
+  TestSessionDiagnostics,
+  TestSessionJoinResult,
+  TestSessionPairing,
+  TestSessionProbeRunResult,
+  TestSessionProbeResult,
+  TestSessionIdentityMethod,
+  TestSessionTransport,
   Transport,
   UserAttributes,
   UserUpdateOperations,
@@ -30,6 +45,7 @@ import type {
   WtsClient,
   WtsClientOptions,
 } from "./types";
+import type { TestSessionRuntime, TestSessionRuntimeInput } from "./test-session";
 import {
   normalizePathname,
   validateEvent,
@@ -61,13 +77,49 @@ export class WtsClientImpl implements WtsClient {
   private readonly options: ResolvedOptions;
   private readonly transport: Transport;
   private readonly lock: MultiTabLock;
+  private readonly experiences: ExperienceRuntime;
+  private testSession: TestSessionRuntime | undefined;
+  private testSessionLoading: Promise<TestSessionRuntime> | undefined;
+  private readonly testSessionInput: TestSessionRuntimeInput;
+  private readonly testSessionMayBePersisted: boolean;
 
-  constructor(options: WtsClientOptions, transport?: Transport) {
+  constructor(
+    options: WtsClientOptions,
+    transport?: Transport,
+    testSessionTransport?: TestSessionTransport,
+  ) {
     this.options = validateOptions(options);
     this.consent = this.options.consent;
     this.transport =
       transport ?? new HttpTransport(this.options.collectorOrigin, this.options.requestTimeoutMs);
     this.lock = new MultiTabLock(`flush-${this.options.sourceKey}`);
+    this.experiences = new ExperienceRuntime({
+      sourceKey: this.options.sourceKey,
+      collectorOrigin: this.options.collectorOrigin,
+      timeoutMs: this.options.requestTimeoutMs,
+      debug: this.options.debug,
+      options: this.options.experiences,
+      getAnalyticsConsent: () => this.consent,
+      getIdentity: () => this.identity,
+      getStorage: () => this.storage,
+      flushIdentity: async () => this.lock.run(async () => this.flushExclusive(false)),
+      onInteraction: (type) =>
+        this.observeTestSession((session) => {
+          session.observeExperienceInteraction(type);
+        }),
+    });
+    this.testSessionInput = {
+      sourceKey: this.options.sourceKey,
+      collectorOrigin: this.options.collectorOrigin,
+      timeoutMs: this.options.requestTimeoutMs,
+      debug: this.options.debug,
+      getAnalyticsConsent: () => this.consent,
+      getExperienceConsent: () => this.experiences.diagnostics().consent,
+      experiencesEnabled: () => this.options.experiences.enabled,
+      ...(testSessionTransport ? { transport: testSessionTransport } : {}),
+    };
+    this.testSessionMayBePersisted = hasPersistedTestSession(this.options.sourceKey);
+    if (this.testSessionMayBePersisted) void this.ensureTestSession();
     this.attributionToken = captureAttributionToken();
     this.installLifecycleListeners();
     if (this.consent === "granted") void this.startEnable();
@@ -99,11 +151,14 @@ export class WtsClientImpl implements WtsClient {
       this.bootstrapped = false;
       clearBrowserSession(this.options.sourceKey);
       this.removeSpaTracking();
+      await this.experiences.setConsent("denied");
+      this.observeTestSession((session) => session.observeConsent());
       return;
     }
     const wasGranted = this.consent === "granted";
     this.consent = "granted";
     if (!wasGranted || !this.storage) await this.startEnable();
+    this.observeTestSession((session) => session.observeConsent());
   }
 
   async page(name?: string): Promise<OperationResult> {
@@ -123,6 +178,13 @@ export class WtsClientImpl implements WtsClient {
     };
     await this.enqueue(event);
     this.lastPagePath = pathname;
+    await this.experiences.evaluate({
+      trigger: { type: "page_view", match: { kind: "pathname_exact", value: pathname } },
+      pathname,
+      ...(event.pageName ? { pageName: event.pageName } : {}),
+      properties: {},
+      triggerEventId: event.clientEventId,
+    });
     return { accepted: true, clientEventId: event.clientEventId };
   }
 
@@ -144,6 +206,13 @@ export class WtsClientImpl implements WtsClient {
       ...(revenue ? { revenue: { ...revenue } } : {}),
     };
     await this.enqueue(event);
+    this.observeTestSession((session) => session.observeEvent(eventKey, properties, revenue));
+    await this.experiences.evaluate({
+      trigger: { type: "custom_event", eventKey, conditions: [] },
+      eventKey,
+      properties,
+      triggerEventId: event.clientEventId,
+    });
     return { accepted: true, clientEventId: event.clientEventId };
   }
 
@@ -203,7 +272,72 @@ export class WtsClientImpl implements WtsClient {
     });
     await this.storage.saveIdentity(this.identity);
     await this.storage.saveAttributionContext();
+    await this.experiences.identityChanged();
     return result;
+  }
+
+  async setExperienceConsent(consent: ExperienceConsentState): Promise<ExperienceConsentResult> {
+    const result = await this.experiences.setConsent(consent);
+    this.observeTestSession((session) => session.observeExperienceConsent());
+    return result;
+  }
+
+  onExperienceAction(handler: ExperienceActionHandler): () => void {
+    return this.experiences.onAction(handler);
+  }
+
+  onExperienceAvailable(handler: ExperienceAvailableHandler): () => void {
+    return this.experiences.onAvailable(handler);
+  }
+
+  presentNextExperience(): Promise<boolean> {
+    return this.experiences.presentNext();
+  }
+
+  dismissCurrentExperience(): Promise<boolean> {
+    return this.experiences.dismissCurrent();
+  }
+
+  getExperienceDiagnostics(): ExperienceDiagnostics {
+    return this.experiences.diagnostics();
+  }
+
+  async joinTestSession(pairing: TestSessionPairing): Promise<TestSessionJoinResult> {
+    return (await this.ensureTestSession()).join(pairing);
+  }
+
+  async leaveTestSession(): Promise<{ accepted: boolean }> {
+    const session =
+      this.testSession ??
+      (this.testSessionMayBePersisted ? await this.ensureTestSession() : undefined);
+    return session ? session.leave() : { accepted: true };
+  }
+
+  async probeTestSessionUrl(url: string): Promise<TestSessionProbeResult> {
+    return (await this.ensureTestSession()).probe(url);
+  }
+
+  async runTestSessionProbes(): Promise<TestSessionProbeRunResult> {
+    return (await this.ensureTestSession()).runProbes();
+  }
+
+  reportTestSessionExperienceInteraction(
+    interaction: "impression" | "action",
+  ): Promise<{ accepted: boolean }> {
+    return this.ensureTestSession().then((session) =>
+      session.reportExperienceInteraction(interaction),
+    );
+  }
+
+  getTestSessionDiagnostics(): TestSessionDiagnostics {
+    return (
+      this.testSession?.diagnostics() ?? {
+        joined: false,
+        compatible: false,
+        checks: [],
+        pendingSignals: 0,
+      }
+    );
   }
 
   async flush(): Promise<FlushResult> {
@@ -211,9 +345,14 @@ export class WtsClientImpl implements WtsClient {
       return { sent: 0, pending: 0 };
     }
     const result = await this.lock.run(async () => this.flushExclusive(false));
+    await this.experiences.flushInteractions();
+    await this.testSession?.flush();
     if (result) return result;
     const state = await this.storage.load();
-    return { sent: 0, pending: state.queue.length + state.identityQueue.length };
+    return {
+      sent: 0,
+      pending: state.queue.length + state.identityQueue.length + state.experienceQueue.length,
+    };
   }
 
   async reset(): Promise<void> {
@@ -227,6 +366,7 @@ export class WtsClientImpl implements WtsClient {
     this.bootstrapClientEventId = createUuid();
     this.bootstrapped = false;
     this.lastPagePath = undefined;
+    await this.experiences.reset();
     if (this.consent === "granted" && !this.destroyed) await this.initializeIdentity();
   }
 
@@ -236,8 +376,39 @@ export class WtsClientImpl implements WtsClient {
     this.cancelRetry();
     this.removeSpaTracking();
     this.removeLifecycleListeners();
+    this.experiences.destroy();
+    this.testSession?.dispose();
+    void this.testSessionLoading?.then((session) => session.dispose());
     const storage = this.storage;
     if (storage) void this.lock.run(async () => storage.close());
+  }
+
+  private ensureTestSession(): Promise<TestSessionRuntime> {
+    if (this.testSession) return Promise.resolve(this.testSession);
+    if (!this.testSessionLoading) {
+      const loading = loadTestSessionRuntime(this.testSessionInput).then((session) => {
+        if (this.destroyed) session.dispose();
+        else this.testSession = session;
+        return session;
+      });
+      this.testSessionLoading = loading;
+      void loading.finally(() => {
+        if (this.testSessionLoading === loading) this.testSessionLoading = undefined;
+      });
+    }
+    return this.testSessionLoading;
+  }
+
+  private observeTestSession(callback: (session: TestSessionRuntime) => void): void {
+    if (this.testSession) {
+      callback(this.testSession);
+      return;
+    }
+    if (this.testSessionLoading) {
+      void this.testSessionLoading.then((session) => {
+        if (!this.destroyed) callback(session);
+      });
+    }
   }
 
   private async enable(): Promise<void> {
@@ -351,7 +522,10 @@ export class WtsClientImpl implements WtsClient {
     if (!this.storage) return { sent: 0, pending: 0 };
     if (this.retryTimer && !keepalive) {
       const state = await this.storage.load();
-      return { sent: 0, pending: state.queue.length + state.identityQueue.length };
+      return {
+        sent: 0,
+        pending: state.queue.length + state.identityQueue.length + state.experienceQueue.length,
+      };
     }
     try {
       await this.ensureBootstrapped();
@@ -390,7 +564,10 @@ export class WtsClientImpl implements WtsClient {
                 identityResponse.accepted.length +
                 identityResponse.duplicates.length +
                 permanentlyRejected.length,
-              pending: pendingState.queue.length + pendingState.identityQueue.length,
+              pending:
+                pendingState.queue.length +
+                pendingState.identityQueue.length +
+                pendingState.experienceQueue.length,
             };
           }
         } catch (error) {
@@ -406,7 +583,8 @@ export class WtsClientImpl implements WtsClient {
             this.handleRetryableError(error);
             return {
               sent: 0,
-              pending: state.queue.length + state.identityQueue.length,
+              pending:
+                state.queue.length + state.identityQueue.length + state.experienceQueue.length,
             };
           }
         }
@@ -416,7 +594,10 @@ export class WtsClientImpl implements WtsClient {
       if (batch.length === 0) {
         return {
           sent: identityBatch.length,
-          pending: refreshedState.queue.length + refreshedState.identityQueue.length,
+          pending:
+            refreshedState.queue.length +
+            refreshedState.identityQueue.length +
+            refreshedState.experienceQueue.length,
         };
       }
       const response = await this.transport.send(this.options.sourceKey, batch, keepalive);
@@ -428,7 +609,10 @@ export class WtsClientImpl implements WtsClient {
       }
       await this.storage.remove(remove);
       const pendingState = await this.storage.load();
-      const pending = pendingState.queue.length + pendingState.identityQueue.length;
+      const pending =
+        pendingState.queue.length +
+        pendingState.identityQueue.length +
+        pendingState.experienceQueue.length;
       if (hasRetryableRejection) this.scheduleRetry();
       else {
         this.retryAttempt = 0;
@@ -438,7 +622,10 @@ export class WtsClientImpl implements WtsClient {
     } catch (error) {
       this.handleRetryableError(error);
       const state = await this.storage.load();
-      return { sent: 0, pending: state.queue.length + state.identityQueue.length };
+      return {
+        sent: 0,
+        pending: state.queue.length + state.identityQueue.length + state.experienceQueue.length,
+      };
     }
   }
 
@@ -511,6 +698,9 @@ export class WtsClientImpl implements WtsClient {
       throw new TypeError("Identity mutation cannot exceed 64 KiB.");
     }
     await this.storage.enqueueIdentity(mutation);
+    for (const method of testSessionIdentityMethods(mutation)) {
+      this.observeTestSession((session) => session.observeIdentity(method));
+    }
     queueMicrotask(() => void this.flush());
     return { accepted: true, clientEventId: mutation.clientMutationId };
   }
@@ -552,11 +742,13 @@ export class WtsClientImpl implements WtsClient {
 
   private readonly onPageHide = () => {
     if (this.consent === "granted") void this.lock.run(() => this.flushExclusive(true));
+    void this.testSession?.flush();
   };
 
   private readonly onVisibilityChange = () => {
     if (document.visibilityState === "hidden" && this.consent === "granted") {
       void this.lock.run(() => this.flushExclusive(true));
+      void this.testSession?.flush();
     }
   };
 
@@ -568,6 +760,28 @@ export class WtsClientImpl implements WtsClient {
   private cancelRetry(): void {
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
+  }
+}
+
+function testSessionIdentityMethods(mutation: IdentityMutation): TestSessionIdentityMethod[] {
+  switch (mutation.type) {
+    case "identify":
+    case "reported_attribution":
+    case "reset_identity":
+      return [mutation.type];
+    case "update_user": {
+      const methods: TestSessionIdentityMethod[] = [];
+      if (mutation.operations?.set && Object.keys(mutation.operations.set).length > 0) {
+        methods.push("update_user");
+      }
+      if (mutation.operations?.setOnce && Object.keys(mutation.operations.setOnce).length > 0) {
+        methods.push("set_once");
+      }
+      if (mutation.operations?.increment && Object.keys(mutation.operations.increment).length > 0) {
+        methods.push("increment");
+      }
+      return methods.length > 0 ? methods : ["update_user"];
+    }
   }
 }
 

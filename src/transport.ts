@@ -6,6 +6,7 @@ import type {
   IdentityBatchResponse,
   IdentityMutation,
   Transport,
+  TestSessionTransport,
   WebEvent,
 } from "./types";
 
@@ -81,6 +82,84 @@ export class HttpTransport implements Transport {
       });
       if (!response.ok) throw await TransportError.fromResponse(response);
       return response;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+export class HttpTestSessionTransport implements TestSessionTransport {
+  constructor(
+    private readonly collectorOrigin: string,
+    private readonly timeoutMs: number,
+  ) {}
+
+  async pair(sourceKey: string, input: Parameters<TestSessionTransport["pair"]>[1]) {
+    return this.json<Awaited<ReturnType<TestSessionTransport["pair"]>>>(
+      "/test/v1/pair",
+      sourceKey,
+      input,
+    );
+  }
+
+  async handshake(sourceKey: string, input: Parameters<TestSessionTransport["handshake"]>[1]) {
+    return this.json<Awaited<ReturnType<TestSessionTransport["handshake"]>>>(
+      "/test/v1/handshake",
+      sourceKey,
+      input,
+    );
+  }
+
+  async signals(sourceKey: string, input: Parameters<TestSessionTransport["signals"]>[1]) {
+    return this.json<Awaited<ReturnType<TestSessionTransport["signals"]>>>(
+      "/test/v1/signals/batch",
+      sourceKey,
+      input,
+    );
+  }
+
+  async resolve(sourceKey: string, input: Parameters<TestSessionTransport["resolve"]>[1]) {
+    return this.json<Awaited<ReturnType<TestSessionTransport["resolve"]>>>(
+      "/test/v1/resolve",
+      sourceKey,
+      input,
+    );
+  }
+
+  async decideExperience(
+    sourceKey: string,
+    input: Parameters<TestSessionTransport["decideExperience"]>[1],
+  ) {
+    return this.json<Awaited<ReturnType<TestSessionTransport["decideExperience"]>>>(
+      "/test/v1/experiences/decide",
+      sourceKey,
+      input,
+    );
+  }
+
+  async leave(sourceKey: string, input: Parameters<TestSessionTransport["leave"]>[1]) {
+    return this.json<Awaited<ReturnType<TestSessionTransport["leave"]>>>(
+      "/test/v1/leave",
+      sourceKey,
+      input,
+    );
+  }
+
+  private async json<T>(path: string, sourceKey: string, body: unknown): Promise<T> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await fetch(`${this.collectorOrigin}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-WTS-Source-Key": sourceKey },
+        body: JSON.stringify(body),
+        credentials: "omit",
+        mode: "cors",
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (!response.ok) throw await TransportError.fromResponse(response);
+      return (await response.json()) as T;
     } finally {
       clearTimeout(timeout);
     }

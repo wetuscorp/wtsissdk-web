@@ -1,10 +1,18 @@
 import { MAX_QUEUE_BYTES, MAX_QUEUE_EVENTS } from "./constants";
 import { byteLength } from "./runtime";
-import type { Identity, IdentityMutation, StorageAdapter, StoredState, WebEvent } from "./types";
+import type {
+  Identity,
+  IdentityMutation,
+  StorageAdapter,
+  StoredExperienceInteraction,
+  StoredState,
+  WebEvent,
+} from "./types";
 
 const META_STORE = "meta";
 const EVENT_STORE = "events";
 const IDENTITY_STORE = "identity_mutations";
+const EXPERIENCE_STORE = "experience_interactions";
 
 export async function createStorage(sourceKey: string): Promise<StorageAdapter> {
   if (typeof indexedDB === "undefined") throw new Error("IndexedDB is unavailable.");
@@ -22,7 +30,7 @@ export async function deleteStorage(sourceKey: string): Promise<void> {
 }
 
 export class MemoryStorage implements StorageAdapter {
-  private state: StoredState = { queue: [], identityQueue: [] };
+  private state: StoredState = { queue: [], identityQueue: [], experienceQueue: [] };
 
   async load(): Promise<StoredState> {
     return clone(this.state);
@@ -52,6 +60,11 @@ export class MemoryStorage implements StorageAdapter {
     trimQueues(this.state);
   }
 
+  async enqueueExperience(interaction: StoredExperienceInteraction): Promise<void> {
+    this.state.experienceQueue.push(clone(interaction));
+    trimQueues(this.state);
+  }
+
   async remove(clientEventIds: ReadonlySet<string>): Promise<void> {
     this.state.queue = this.state.queue.filter((event) => !clientEventIds.has(event.clientEventId));
   }
@@ -62,8 +75,14 @@ export class MemoryStorage implements StorageAdapter {
     );
   }
 
+  async removeExperiences(clientInteractionIds: ReadonlySet<string>): Promise<void> {
+    this.state.experienceQueue = this.state.experienceQueue.filter(
+      (interaction) => !clientInteractionIds.has(interaction.clientInteractionId),
+    );
+  }
+
   async clear(): Promise<void> {
-    this.state = { queue: [], identityQueue: [] };
+    this.state = { queue: [], identityQueue: [], experienceQueue: [] };
   }
 
   close(): void {}
@@ -73,7 +92,7 @@ class IndexedDbStorage implements StorageAdapter {
   private constructor(private readonly database: IDBDatabase) {}
 
   static async open(sourceKey: string): Promise<IndexedDbStorage> {
-    const request = indexedDB.open(databaseName(sourceKey), 2);
+    const request = indexedDB.open(databaseName(sourceKey), 3);
     request.onupgradeneeded = () => {
       const database = request.result;
       if (!database.objectStoreNames.contains(META_STORE)) database.createObjectStore(META_STORE);
@@ -83,29 +102,41 @@ class IndexedDbStorage implements StorageAdapter {
       if (!database.objectStoreNames.contains(IDENTITY_STORE)) {
         database.createObjectStore(IDENTITY_STORE, { keyPath: "clientMutationId" });
       }
+      if (!database.objectStoreNames.contains(EXPERIENCE_STORE)) {
+        database.createObjectStore(EXPERIENCE_STORE, { keyPath: "clientInteractionId" });
+      }
     };
     return new IndexedDbStorage(await requestResult(request));
   }
 
   async load(): Promise<StoredState> {
     const transaction = this.database.transaction(
-      [META_STORE, EVENT_STORE, IDENTITY_STORE],
+      [META_STORE, EVENT_STORE, IDENTITY_STORE, EXPERIENCE_STORE],
       "readonly",
     );
     const meta = transaction.objectStore(META_STORE);
     const events = transaction.objectStore(EVENT_STORE);
     const mutations = transaction.objectStore(IDENTITY_STORE);
-    const [identity, attributionContextId, attributionContextExpiresAt, queue, identityQueue] =
-      await Promise.all([
-        requestResult(meta.get("identity") as IDBRequest<Identity | undefined>),
-        requestResult(meta.get("attributionContextId") as IDBRequest<string | undefined>),
-        requestResult(meta.get("attributionContextExpiresAt") as IDBRequest<string | undefined>),
-        requestResult(events.getAll() as IDBRequest<WebEvent[]>),
-        requestResult(mutations.getAll() as IDBRequest<IdentityMutation[]>),
-      ]);
+    const experiences = transaction.objectStore(EXPERIENCE_STORE);
+    const [
+      identity,
+      attributionContextId,
+      attributionContextExpiresAt,
+      queue,
+      identityQueue,
+      experienceQueue,
+    ] = await Promise.all([
+      requestResult(meta.get("identity") as IDBRequest<Identity | undefined>),
+      requestResult(meta.get("attributionContextId") as IDBRequest<string | undefined>),
+      requestResult(meta.get("attributionContextExpiresAt") as IDBRequest<string | undefined>),
+      requestResult(events.getAll() as IDBRequest<WebEvent[]>),
+      requestResult(mutations.getAll() as IDBRequest<IdentityMutation[]>),
+      requestResult(experiences.getAll() as IDBRequest<StoredExperienceInteraction[]>),
+    ]);
     await transactionDone(transaction);
     queue.sort((left, right) => left.occurredAt.localeCompare(right.occurredAt));
     identityQueue.sort((left, right) => left.occurredAt.localeCompare(right.occurredAt));
+    experienceQueue.sort((left, right) => left.occurredAt.localeCompare(right.occurredAt));
     return {
       ...(identity ? { identity } : {}),
       ...(attributionContextId && attributionContextExpiresAt
@@ -113,6 +144,7 @@ class IndexedDbStorage implements StorageAdapter {
         : {}),
       queue,
       identityQueue,
+      experienceQueue,
     };
   }
 
@@ -178,6 +210,13 @@ class IndexedDbStorage implements StorageAdapter {
     await transactionDone(transaction);
   }
 
+  async enqueueExperience(interaction: StoredExperienceInteraction): Promise<void> {
+    const transaction = this.database.transaction(EXPERIENCE_STORE, "readwrite");
+    transaction.objectStore(EXPERIENCE_STORE).put(interaction);
+    await transactionDone(transaction);
+    await this.trimPersistentQueues();
+  }
+
   async remove(clientEventIds: ReadonlySet<string>): Promise<void> {
     if (clientEventIds.size === 0) return;
     const transaction = this.database.transaction(EVENT_STORE, "readwrite");
@@ -194,14 +233,23 @@ class IndexedDbStorage implements StorageAdapter {
     await transactionDone(transaction);
   }
 
+  async removeExperiences(clientInteractionIds: ReadonlySet<string>): Promise<void> {
+    if (clientInteractionIds.size === 0) return;
+    const transaction = this.database.transaction(EXPERIENCE_STORE, "readwrite");
+    const store = transaction.objectStore(EXPERIENCE_STORE);
+    for (const id of clientInteractionIds) store.delete(id);
+    await transactionDone(transaction);
+  }
+
   async clear(): Promise<void> {
     const transaction = this.database.transaction(
-      [META_STORE, EVENT_STORE, IDENTITY_STORE],
+      [META_STORE, EVENT_STORE, IDENTITY_STORE, EXPERIENCE_STORE],
       "readwrite",
     );
     transaction.objectStore(META_STORE).clear();
     transaction.objectStore(EVENT_STORE).clear();
     transaction.objectStore(IDENTITY_STORE).clear();
+    transaction.objectStore(EXPERIENCE_STORE).clear();
     await transactionDone(transaction);
   }
 
@@ -214,15 +262,30 @@ class IndexedDbStorage implements StorageAdapter {
     transaction.objectStore(META_STORE).put(value, key);
     await transactionDone(transaction);
   }
+
+  private async trimPersistentQueues(): Promise<void> {
+    const state = await this.load();
+    const before = new Set(state.experienceQueue.map((item) => item.clientInteractionId));
+    trimQueues(state);
+    const retained = new Set(state.experienceQueue.map((item) => item.clientInteractionId));
+    const removed = new Set([...before].filter((id) => !retained.has(id)));
+    await this.removeExperiences(removed);
+  }
 }
 
 function trimQueues(state: StoredState): void {
   while (
-    state.queue.length + state.identityQueue.length > MAX_QUEUE_EVENTS ||
-    byteLength({ events: state.queue, mutations: state.identityQueue }) > MAX_QUEUE_BYTES
+    state.queue.length + state.identityQueue.length + state.experienceQueue.length >
+      MAX_QUEUE_EVENTS ||
+    byteLength({
+      events: state.queue,
+      mutations: state.identityQueue,
+      interactions: state.experienceQueue,
+    }) > MAX_QUEUE_BYTES
   ) {
     if (state.queue.length > 0) state.queue.shift();
-    else state.identityQueue.shift();
+    else if (state.identityQueue.length > 0) state.identityQueue.shift();
+    else state.experienceQueue.shift();
   }
 }
 

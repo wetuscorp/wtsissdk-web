@@ -1,4 +1,4 @@
-export const SDK_VERSION = "0.2.0-alpha.1";
+export const SDK_VERSION = "0.3.0-alpha.1";
 export const DEFAULT_COLLECTOR_ORIGIN = "https://collect.wts.is";
 export const MAX_QUEUE_EVENTS = 100;
 export const MAX_QUEUE_BYTES = 1024 * 1024;

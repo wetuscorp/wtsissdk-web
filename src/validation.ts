@@ -13,14 +13,15 @@ const currencyPattern = /^[A-Z]{3}$/;
 const amountPattern = /^-?\d{1,12}(?:\.\d{1,6})?$/;
 const attributeKeyPattern = /^[a-z][a-z0-9_]{0,63}$/;
 
-export function validateOptions(
-  options: WtsClientOptions,
-): Required<
+export function validateOptions(options: WtsClientOptions): Required<
   Pick<
     WtsClientOptions,
     "sourceKey" | "autoTrackPageViews" | "collectorOrigin" | "requestTimeoutMs" | "debug"
   >
-> & { consent: NonNullable<WtsClientOptions["consent"]> } {
+> & {
+  consent: NonNullable<WtsClientOptions["consent"]>;
+  experiences: Required<NonNullable<WtsClientOptions["experiences"]>>;
+} {
   if (!sourceKeyPattern.test(options.sourceKey)) {
     throw new TypeError("sourceKey must be a valid wts.is Web App source key.");
   }
@@ -35,6 +36,39 @@ export function validateOptions(
   if (!Number.isInteger(timeout) || timeout < 250 || timeout > 30_000) {
     throw new TypeError("requestTimeoutMs must be an integer between 250 and 30000.");
   }
+  const experienceOptions = options.experiences;
+  const normalizeStrings = (
+    values: string[] | undefined,
+    maximum: number,
+    field: string,
+  ): string[] => {
+    const result = [...new Set((values ?? []).map((value) => value.trim()).filter(Boolean))];
+    if (result.length > maximum)
+      throw new TypeError(`${field} can contain at most ${maximum} values.`);
+    return result;
+  };
+  const allowedWebOrigins = normalizeStrings(
+    experienceOptions?.allowedWebOrigins,
+    20,
+    "allowedWebOrigins",
+  ).map((value) => {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "https:" && !isLocalhost(parsed.hostname)) {
+      throw new TypeError("Experience web origins must use HTTPS outside localhost.");
+    }
+    return parsed.origin.toLowerCase();
+  });
+  const allowedDeepLinkSchemes = normalizeStrings(
+    experienceOptions?.allowedDeepLinkSchemes,
+    20,
+    "allowedDeepLinkSchemes",
+  ).map((value) => {
+    const normalized = value.toLowerCase().replace(/:$/, "");
+    if (!/^[a-z][a-z0-9+.-]{1,31}$/.test(normalized)) {
+      throw new TypeError(`Invalid deep-link scheme: ${value}`);
+    }
+    return normalized;
+  });
   return {
     sourceKey: options.sourceKey,
     consent: options.consent ?? "pending",
@@ -42,6 +76,27 @@ export function validateOptions(
     collectorOrigin: collector.origin,
     requestTimeoutMs: timeout,
     debug: options.debug ?? false,
+    experiences: {
+      enabled: experienceOptions?.enabled ?? false,
+      renderMode: experienceOptions?.renderMode ?? "automatic",
+      allowedInternalRoutes: normalizeStrings(
+        experienceOptions?.allowedInternalRoutes,
+        100,
+        "allowedInternalRoutes",
+      ),
+      allowedCallbackKeys: normalizeStrings(
+        experienceOptions?.allowedCallbackKeys,
+        100,
+        "allowedCallbackKeys",
+      ),
+      allowedDeepLinkHosts: normalizeStrings(
+        experienceOptions?.allowedDeepLinkHosts,
+        20,
+        "allowedDeepLinkHosts",
+      ).map((value) => value.toLowerCase()),
+      allowedDeepLinkSchemes,
+      allowedWebOrigins,
+    },
   };
 }
 
