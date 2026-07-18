@@ -55,6 +55,8 @@ export interface ManifestCampaign {
 export interface ExperienceManifest {
   schemaVersion: 1;
   sourceId: string;
+  /** Public source key, signed to prevent cross-source manifest replay. */
+  sourceKey: string;
   sourceManifestVersion: number;
   environment?: "production" | "staging" | "development";
   generatedAt: string;

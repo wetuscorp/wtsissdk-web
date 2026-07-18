@@ -2,21 +2,27 @@
 
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and Semantic Versioning.
 
-> The `0.4.0-alpha.1` source line below is not an npm publication claim.
-> Consume SDK Test & Validate only from its matching published web package
-> release.
-
 ## 0.4.0-alpha.1
 
 - Require a host-pinned Ed25519 public-key ring to verify Experience manifests
   before any manifest payload is parsed or used.
+- Bind each verified Experience manifest to the configured public source key,
+  preventing a valid manifest from being replayed by a different source.
+- Require an exact SHA-384 SRI pin before the versioned IIFE loads the
+  executable Experiences companion; a missing or malformed pin fails closed.
 - Added explicit in-memory profile consent for personalized Experiences without
   changing existing analytics or identity consent behavior.
+- Require a collector-accepted `identify()` binding before personalized
+  Experiences can evaluate; the diagnostics surface reports the missing
+  identity condition without weakening contextual delivery.
 - Hardened HTTPS deep-link actions to exact hostname allowlists and reject
-  HTTPS scheme-only authorization.
+  HTTPS scheme-only authorization, browser/document schemes, and unsafe custom
+  schemes even when configuration is bypassed.
 - Defined the manual presentation contract with opaque handles, idempotent
   lifecycle acknowledgements, queue-head-only offers, and cooldown-safe next
   offers after dismissal or render failure.
+- Consume the global two-overlay session cap when an overlay is admitted for
+  presentation, rather than after a qualified impression.
 - Cancel delayed automatic rendering when consent changes or the client is
   destroyed.
 

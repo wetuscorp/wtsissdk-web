@@ -7,10 +7,10 @@ Consent-first browser measurement and deterministic wts.is link attribution. The
 > lifecycle while retaining Web Protocol V3 analytics, identity, deterministic
 > attribution, and SDK Test Session V1 behavior.
 
-> **Release note:** SDK Test & Validate APIs below are source-line APIs. Use
-> them only after the matching web package release has been published. This
-> document does not claim that `0.4.0-alpha.1` is already available from npm
-> or a CDN.
+> **Version discipline:** Keep the npm package, versioned IIFE and its two
+> companion artifacts on the same `0.4.0-alpha.1` release. SDK Test & Validate
+> and Experiences deliberately fail closed when their matching companion is
+> unavailable or cannot be verified.
 
 ## Requirements
 
@@ -27,7 +27,7 @@ analytics continues to work normally.
 ## npm installation
 
 ```bash
-npm install @wetusco/wts-web-sdk@<matching-published-version>
+npm install @wetusco/wts-web-sdk@0.4.0-alpha.1
 ```
 
 ```ts
@@ -58,9 +58,10 @@ Use a versioned artifact and the SRI value shipped next to it. Do not use an unv
 
 ```html
 <script
-  src="https://cdn.jsdelivr.net/npm/@wetusco/wts-web-sdk@<matching-published-version>/dist/wts-web.iife.min.js"
-  integrity="<sha384-from-the-matching-published-release>"
+  src="https://cdn.jsdelivr.net/npm/@wetusco/wts-web-sdk@0.4.0-alpha.1/dist/wts-web.iife.min.js"
+  integrity="<sha384-from-wts-web.iife.min.js.sri>"
   crossorigin="anonymous"
+  data-wts-web-experiences-integrity="<sha384-from-wts-web-experiences.iife.min.js.sri>"
 ></script>
 <script>
   const wts = window.WtsWeb.createWtsClient({
@@ -70,15 +71,20 @@ Use a versioned artifact and the SRI value shipped next to it. Do not use an unv
 </script>
 ```
 
-The IIFE exports `window.WtsWeb`. For a published version, use the exact
-SHA-384 value supplied next to that release in `dist/wts-web.iife.min.js.sri`.
+The IIFE exports `window.WtsWeb`. Use the exact SHA-384 value supplied with
+this release in `dist/wts-web.iife.min.js.sri`.
 The SDK Test & Validate methods remain available on that client. When one is
 called, the SDK loads the matching `wts-web-test-session.iife.min.js` companion
 from the same versioned `dist/` directory. Experiences follows the same model:
 when it is explicitly enabled, the SDK loads
-`wts-web-experiences.iife.min.js`. Deploy all three version-matched artifacts
-together so these opt-in capabilities remain available without inflating the
-analytics entry bundle.
+`wts-web-experiences.iife.min.js`. Set
+`data-wts-web-experiences-integrity` to the exact value in that companion's
+`wts-web-experiences.iife.min.js.sri` file; the IIFE fails closed and does not
+inject the companion if the pin is absent or malformed. The primary and
+companion artifacts must come from the same immutable release directory and
+their host must support anonymous CORS for browser SRI verification. Deploy all
+three version-matched artifacts together so these opt-in capabilities remain
+available without inflating the analytics entry bundle.
 
 ## Consent behavior
 
@@ -169,17 +175,22 @@ overlap during rotation. Never derive, export, copy, or configure a private
 signing key in a browser or application source tree. A missing matching key or
 an invalid signature fails closed and no Experience is presented.
 
-Use `personalized` only after an explicit profile-consent signal and a
-completed `identify()` operation. `setProfileConsent` is an in-memory
-Experience permission; it does not retroactively gate or change analytics and
-identity methods. `pending` makes no Experience request. `denied` removes
-cached manifest, assignment and unsent interaction data.
+Use `personalized` only after an explicit profile-consent signal and an
+`identify()` mutation has been accepted by the collector. This is a real
+identity-binding gate: the SDK does not treat its anonymous browser identity
+as a known profile. Call `identify()`, await `flush()`, then enable
+personalized Experiences. `setProfileConsent` is an in-memory Experience
+permission; it does not retroactively gate or change analytics and identity
+methods. `pending` makes no Experience request. `denied` removes cached
+manifest, assignment and unsent interaction data.
 
 ```ts
 await wts.setConsent("granted");
 await wts.setProfileConsent(true); // Call on every page load from your CMP/privacy flow.
 await wts.identify("customer_1842");
+await wts.flush(); // Personalized Experiences require a collector-accepted binding.
 await wts.setExperienceConsent("personalized");
+await wts.page("Checkout");
 ```
 
 Automatic mode loads the accessible Shadow DOM renderer only when a campaign
@@ -188,7 +199,9 @@ candidate once through `onExperienceAvailable`, with an opaque handle that is
 valid only for that presentation. `presentNextExperience()` is automatic-mode
 only and returns `false` in manual mode. Use `onExperienceAction` for
 allowlisted application callbacks. At most one experience is visible and the
-local candidate queue is bounded to five.
+local candidate queue is bounded to five. A session can admit at most two
+overlay presentations (modal, slide-in, or bottom sheet), even if a user
+dismisses one before it qualifies as an impression.
 
 An impression is recorded only after at least half of the experience remains
 visible for one uninterrupted second. Interaction delivery uses the persistent
@@ -236,7 +249,7 @@ const unsubscribeManual = wts.onExperienceAvailable(async ({ experience, handle 
 unsubscribeManual();
 ```
 
-For an unpublished device test, copy
+For a draft Experience device test, copy
 `wts.getExperienceDiagnostics().testDeviceToken` into the dashboard test
 panel for the same Web App. The random token is scoped to this SDK instance;
 it contains no user, browser, or profile identifier. Test impressions and

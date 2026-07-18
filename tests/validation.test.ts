@@ -79,6 +79,14 @@ describe("validation", () => {
         experiences: { enabled: true, allowedDeepLinkHosts: ["https://links.example.com"] },
       }),
     ).toThrow(/hostname only/);
+    for (const unsafeScheme of ["javascript", "data", "file", "http", "intent"]) {
+      expect(() =>
+        validateOptions({
+          sourceKey: "web_source_key",
+          experiences: { enabled: true, allowedDeepLinkSchemes: [unsafeScheme] },
+        }),
+      ).toThrow(/Unsafe deep-link scheme/);
+    }
   });
 
   it("enforces scalar properties and decimal revenue", () => {

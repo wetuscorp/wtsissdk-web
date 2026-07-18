@@ -29,6 +29,7 @@ import type {
   ExperiencePresentationResult,
   FlushResult,
   Identity,
+  IdentityBatchResponse,
   IdentityMutation,
   OperationResult,
   ReportedAttribution,
@@ -65,6 +66,8 @@ const ATTRIBUTION_CONTEXT_TTL_MS = 7 * 24 * 60 * 60_000;
 export class WtsClientImpl implements WtsClient {
   private consent: ConsentState;
   private profileConsentGranted = false;
+  /** Set only after the collector accepted an identify mutation in this runtime. */
+  private profileIdentityReady = false;
   private storage: StorageAdapter | undefined;
   private identity: Identity | undefined;
   private attributionContextId: string | undefined;
@@ -104,6 +107,7 @@ export class WtsClientImpl implements WtsClient {
       options: this.options.experiences,
       getAnalyticsConsent: () => this.consent,
       getProfileConsent: () => this.profileConsentGranted,
+      getProfileIdentityReady: () => this.profileIdentityReady,
       getIdentity: () => this.identity,
       getStorage: () => this.storage,
       flushIdentity: async () => this.lock.run(async () => this.flushExclusive(false)),
@@ -153,6 +157,7 @@ export class WtsClientImpl implements WtsClient {
       this.storage = undefined;
       this.identity = undefined;
       this.profileConsentGranted = false;
+      this.profileIdentityReady = false;
       this.attributionContextId = undefined;
       this.attributionContextExpiresAt = undefined;
       this.attributionToken = undefined;
@@ -275,6 +280,7 @@ export class WtsClientImpl implements WtsClient {
     const result = await this.enqueueIdentityMutation({ type: "reset_identity" });
     if (!this.storage) return result;
     this.identity = { anonymousId: createUuid(), sessionId: createUuid() };
+    this.profileIdentityReady = false;
     this.bootstrapClientEventId = createUuid();
     this.attributionContextId = undefined;
     this.attributionContextExpiresAt = undefined;
@@ -607,6 +613,7 @@ export class WtsClientImpl implements WtsClient {
               ...permanentlyRejected,
             ]),
           );
+          this.applyAcceptedIdentityBindings(identityBatch, identityResponse);
           if (permanentlyRejected.length > 0) {
             safeWarn(
               this.options.debug,
@@ -734,6 +741,18 @@ export class WtsClientImpl implements WtsClient {
     await this.ensureReady();
     unavailable = this.unavailableResult();
     return unavailable;
+  }
+
+  private applyAcceptedIdentityBindings(
+    mutations: IdentityMutation[],
+    response: IdentityBatchResponse,
+  ): void {
+    const accepted = new Set([...response.accepted, ...response.duplicates]);
+    for (const mutation of mutations) {
+      if (!accepted.has(mutation.clientMutationId)) continue;
+      if (mutation.type === "identify") this.profileIdentityReady = true;
+      if (mutation.type === "reset_identity") this.profileIdentityReady = false;
+    }
   }
 
   private async enqueueIdentityMutation(

@@ -1,6 +1,7 @@
 import { MAX_BATCH_BYTES, MAX_BATCH_EVENTS, SDK_VERSION } from "../constants";
 import { byteLength, createUuid, locale, safeWarn } from "../runtime";
 import { TransportError } from "../transport";
+import { isUnsafeDeepLinkScheme } from "../validation";
 import { verifyExperienceManifestPayload } from "./manifest-verifier";
 import type {
   ConsentState,
@@ -42,6 +43,8 @@ export interface ExperienceRuntimeDependencies {
   options: ResolvedExperienceOptions;
   getAnalyticsConsent(): ConsentState;
   getProfileConsent(): boolean;
+  /** True only after an identify mutation was accepted by the collector. */
+  getProfileIdentityReady(): boolean;
   getIdentity(): Identity | undefined;
   getStorage(): StorageAdapter | undefined;
   flushIdentity(): Promise<unknown>;
@@ -111,11 +114,22 @@ export class ExperienceRuntime {
     if (this.dependencies.getAnalyticsConsent() !== "granted") {
       return { accepted: false, reason: "analytics_consent_required" };
     }
+    if (consent === "personalized" && this.dependencies.getProfileConsent()) {
+      await this.dependencies.flushIdentity();
+    }
     if (
       consent === "personalized" &&
-      (!this.dependencies.getProfileConsent() || !this.dependencies.getIdentity())
+      (!this.dependencies.getProfileConsent() || !this.dependencies.getProfileIdentityReady())
     ) {
-      return { accepted: false, reason: "profile_consent_required" };
+      this.lastErrorCode = this.dependencies.getProfileConsent()
+        ? "EXPERIENCE_PROFILE_IDENTITY_REQUIRED"
+        : "EXPERIENCE_PROFILE_CONSENT_REQUIRED";
+      return {
+        accepted: false,
+        reason: this.dependencies.getProfileConsent()
+          ? "profile_identity_required"
+          : "profile_consent_required",
+      };
     }
     this.consent = consent;
     try {
@@ -165,7 +179,13 @@ export class ExperienceRuntime {
     if (this.consent === "personalized") {
       try {
         await this.dependencies.flushIdentity();
-        if (!this.canEvaluate() || !this.dependencies.getProfileConsent()) return;
+        if (
+          !this.canEvaluate() ||
+          !this.dependencies.getProfileConsent() ||
+          !this.dependencies.getProfileIdentityReady()
+        ) {
+          return;
+        }
         const response = await this.transport.decide({
           consent: this.consent,
           profileConsentGranted: this.dependencies.getProfileConsent(),
@@ -205,12 +225,10 @@ export class ExperienceRuntime {
       return false;
     }
     const candidate = this.queue.shift()!;
-    if (
-      ["modal", "slide_in"].includes(candidate.placement) &&
-      this.sessionOverlays >= MAX_SESSION_OVERLAYS
-    ) {
+    if (isOverlayPlacement(candidate.placement) && this.sessionOverlays >= MAX_SESSION_OVERLAYS) {
       return this.presentNext();
     }
+    this.admitOverlay(candidate);
     this.current = candidate;
     await this.record(candidate, "render_started");
     const controller = new AbortController();
@@ -271,6 +289,13 @@ export class ExperienceRuntime {
     }
     if (this.current) return this.presentationRejected("presentation_not_presenting");
     const candidate = this.queue.shift()!;
+    if (!this.canAdmitOverlay(candidate)) {
+      this.manualOfferedHandle = undefined;
+      state.dismissed = true;
+      this.scheduleNextPresentation();
+      return this.presentationRejected("session_overlay_limit_reached");
+    }
+    this.admitOverlay(candidate);
     this.manualOfferedHandle = undefined;
     this.current = candidate;
     state.rendered = true;
@@ -466,6 +491,7 @@ export class ExperienceRuntime {
       kid: response.keyId,
       signature: response.signature,
       manifestVerificationKeys: this.dependencies.options.manifestVerificationKeys,
+      expectedSourceKey: this.dependencies.sourceKey,
     });
     const expiresAt = Date.parse(manifest.expiresAt);
     if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
@@ -630,7 +656,6 @@ export class ExperienceRuntime {
     if (this.reportedImpressionHandles.has(experience.presentationHandle)) return;
     this.reportedImpressionHandles.add(experience.presentationHandle);
     this.sessionImpressions += 1;
-    if (["modal", "slide_in"].includes(experience.placement)) this.sessionOverlays += 1;
     await this.record(experience, "impression");
   }
 
@@ -726,6 +751,7 @@ export class ExperienceRuntime {
         try {
           const parsed = new URL(target);
           const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
+          if (parsed.protocol !== "https:" && isUnsafeDeepLinkScheme(scheme)) return false;
           return parsed.protocol === "https:"
             ? this.isAllowedHttpsDeepLink(parsed)
             : this.dependencies.options.allowedDeepLinkSchemes.includes(scheme);
@@ -755,6 +781,7 @@ export class ExperienceRuntime {
     try {
       const parsed = new URL(target);
       const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
+      if (parsed.protocol !== "https:" && isUnsafeDeepLinkScheme(scheme)) return false;
       const allowed =
         parsed.protocol === "https:"
           ? this.isAllowedHttpsDeepLink(parsed)
@@ -817,6 +844,7 @@ export class ExperienceRuntime {
     ) {
       return;
     }
+    this.discardOverCapOverlayCandidates();
     const candidate = this.queue[0];
     if (!candidate || this.manualOfferedHandle === candidate.presentationHandle) return;
     const state = this.manualPresentations.get(candidate.presentationHandle);
@@ -845,6 +873,25 @@ export class ExperienceRuntime {
         this.offerNextManualCandidate();
       }
     }, 3_000);
+  }
+
+  private canAdmitOverlay(candidate: QueuedExperience): boolean {
+    return !isOverlayPlacement(candidate.placement) || this.sessionOverlays < MAX_SESSION_OVERLAYS;
+  }
+
+  private admitOverlay(candidate: QueuedExperience): void {
+    if (isOverlayPlacement(candidate.placement)) this.sessionOverlays += 1;
+  }
+
+  private discardOverCapOverlayCandidates(): void {
+    while (this.queue[0] && !this.canAdmitOverlay(this.queue[0])) {
+      const candidate = this.queue.shift()!;
+      const state = this.manualPresentations.get(candidate.presentationHandle);
+      if (state) state.dismissed = true;
+      if (this.manualOfferedHandle === candidate.presentationHandle) {
+        this.manualOfferedHandle = undefined;
+      }
+    }
   }
 
   private sortQueue(): void {
@@ -974,6 +1021,7 @@ export class ExperienceRuntime {
       this.dependencies.getAnalyticsConsent() === "granted" &&
       (this.consent === "contextual" || this.consent === "personalized") &&
       (this.consent !== "personalized" || this.dependencies.getProfileConsent()) &&
+      (this.consent !== "personalized" || this.dependencies.getProfileIdentityReady()) &&
       Boolean(this.dependencies.getIdentity()) &&
       Boolean(this.dependencies.getStorage())
     );
@@ -1097,6 +1145,10 @@ function compare(current: unknown, operator: string, expected: unknown): boolean
 
 function compareCampaigns(left: ManifestCampaign, right: ManifestCampaign) {
   return right.priority - left.priority || left.campaignId.localeCompare(right.campaignId);
+}
+
+function isOverlayPlacement(placement: QueuedExperience["placement"]): boolean {
+  return placement === "modal" || placement === "slide_in" || placement === "bottom_sheet";
 }
 
 function compareQueued(left: QueuedExperience, right: QueuedExperience) {

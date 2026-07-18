@@ -39,11 +39,25 @@ export class ExperienceFacade {
       if (this.dependencies.getAnalyticsConsent() !== "granted") {
         return { accepted: false, reason: "analytics_consent_required" };
       }
+      if (consent === "personalized" && this.dependencies.getProfileConsent()) {
+        // Identity mutations are FIFO ahead of events. Flush before checking
+        // readiness so an identify call immediately before this method can
+        // establish its server-side binding without a timing race.
+        await this.dependencies.flushIdentity();
+      }
       if (
         consent === "personalized" &&
-        (!this.dependencies.getProfileConsent() || !this.dependencies.getIdentity())
+        (!this.dependencies.getProfileConsent() || !this.dependencies.getProfileIdentityReady())
       ) {
-        return { accepted: false, reason: "profile_consent_required" };
+        this.lastErrorCode = this.dependencies.getProfileConsent()
+          ? "EXPERIENCE_PROFILE_IDENTITY_REQUIRED"
+          : "EXPERIENCE_PROFILE_CONSENT_REQUIRED";
+        return {
+          accepted: false,
+          reason: this.dependencies.getProfileConsent()
+            ? "profile_identity_required"
+            : "profile_consent_required",
+        };
       }
     }
     const revision = ++this.consentRevision;

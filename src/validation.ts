@@ -12,6 +12,27 @@ const sourceKeyPattern = /^[A-Za-z0-9_-]{8,128}$/;
 const currencyPattern = /^[A-Z]{3}$/;
 const amountPattern = /^-?\d{1,12}(?:\.\d{1,6})?$/;
 const attributeKeyPattern = /^[a-z][a-z0-9_]{0,63}$/;
+const unsafeDeepLinkSchemes = new Set([
+  "about",
+  "blob",
+  "chrome",
+  "chrome-extension",
+  "data",
+  "edge",
+  "file",
+  "filesystem",
+  "http",
+  "https",
+  "intent",
+  "javascript",
+  "moz-extension",
+  "ms-appx",
+  "ms-appx-web",
+  "vbscript",
+  "view-source",
+  "ws",
+  "wss",
+]);
 
 export function validateOptions(options: WtsClientOptions): Required<
   Pick<
@@ -92,6 +113,9 @@ export function validateOptions(options: WtsClientOptions): Required<
     if (normalized === "https") {
       throw new TypeError("Use allowedDeepLinkHosts to allow HTTPS deep links.");
     }
+    if (unsafeDeepLinkSchemes.has(normalized)) {
+      throw new TypeError(`Unsafe deep-link scheme is not allowed: ${value}`);
+    }
     return normalized;
   });
   return {
@@ -124,6 +148,15 @@ export function validateOptions(options: WtsClientOptions): Required<
       allowedWebOrigins,
     },
   };
+}
+
+/**
+ * Browser and document URL schemes are never valid app deep links. Keep this
+ * exported policy shared with the runtime because manifests are server data and
+ * must be defended even if a client bypasses option validation.
+ */
+export function isUnsafeDeepLinkScheme(value: string): boolean {
+  return unsafeDeepLinkSchemes.has(value.toLowerCase().replace(/:$/, ""));
 }
 
 export function validateEvent(

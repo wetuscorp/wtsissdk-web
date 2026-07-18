@@ -11,6 +11,8 @@ export async function verifyExperienceManifestPayload(input: {
   kid: string;
   signature: string;
   manifestVerificationKeys: Readonly<Record<string, string>>;
+  /** The source key configured on this SDK client. */
+  expectedSourceKey: string;
 }): Promise<ExperienceManifest> {
   const encodedPublicKey = input.manifestVerificationKeys[input.kid];
   if (!encodedPublicKey) throw experienceError("EXPERIENCE_MANIFEST_KEY_UNTRUSTED");
@@ -74,9 +76,19 @@ export async function verifyExperienceManifestPayload(input: {
     const parsed: unknown = JSON.parse(
       new TextDecoder("utf-8", { fatal: true }).decode(payloadBytes),
     ) as unknown;
-    return parseExperienceManifest(parsed);
+    const manifest = parseExperienceManifest(parsed);
+    if (manifest.sourceKey !== input.expectedSourceKey) {
+      throw experienceError("EXPERIENCE_MANIFEST_SOURCE_MISMATCH");
+    }
+    return manifest;
   } catch (error) {
-    if (error instanceof Error && error.message === "EXPERIENCE_MANIFEST_INVALID") throw error;
+    if (
+      error instanceof Error &&
+      (error.message === "EXPERIENCE_MANIFEST_INVALID" ||
+        error.message === "EXPERIENCE_MANIFEST_SOURCE_MISMATCH")
+    ) {
+      throw error;
+    }
     throw experienceError("EXPERIENCE_MANIFEST_PAYLOAD_INVALID");
   }
 }
@@ -90,6 +102,8 @@ function parseExperienceManifest(value: unknown): ExperienceManifest {
     manifest.schemaVersion !== 1 ||
     typeof manifest.sourceId !== "string" ||
     !manifest.sourceId ||
+    typeof manifest.sourceKey !== "string" ||
+    !manifest.sourceKey ||
     !Number.isInteger(manifest.sourceManifestVersion) ||
     typeof manifest.generatedAt !== "string" ||
     typeof manifest.expiresAt !== "string" ||

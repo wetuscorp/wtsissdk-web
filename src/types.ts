@@ -126,7 +126,11 @@ export interface ExperienceDiagnostics {
 export interface ExperienceConsentResult {
   accepted: boolean;
   reason?:
-    "feature_disabled" | "analytics_consent_required" | "profile_consent_required" | "destroyed";
+    | "feature_disabled"
+    | "analytics_consent_required"
+    | "profile_consent_required"
+    | "profile_identity_required"
+    | "destroyed";
 }
 
 export interface ExperiencePresentationResult {
@@ -139,6 +143,7 @@ export interface ExperiencePresentationResult {
     | "consent_required"
     | "presentation_not_found"
     | "presentation_not_presenting"
+    | "session_overlay_limit_reached"
     | "already_reported"
     | "invalid_action"
     | "invalid_failure_code"

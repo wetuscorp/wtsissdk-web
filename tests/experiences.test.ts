@@ -3,6 +3,7 @@ import { generateKeyPairSync, sign } from "node:crypto";
 
 import { WtsClientImpl } from "../src/client";
 import { renderExperience } from "../src/experiences/renderer";
+import { ExperienceRuntime } from "../src/experiences/runtime";
 import type { ExperienceManifest, QueuedExperience } from "../src/experiences/types";
 import type {
   BatchResponse,
@@ -375,6 +376,37 @@ describe("Web Experiences", () => {
     );
   });
 
+  it("fails closed when a validly signed manifest belongs to a different source", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        if (!requestUrl(input).endsWith("/experiences/v1/bootstrap")) {
+          throw new Error("Interactions must not be sent for a cross-source manifest.");
+        }
+        return jsonResponse(bootstrapFixture({ sourceKey: "web_other_source_123456" }));
+      }),
+    );
+    const client = new WtsClientImpl(
+      {
+        sourceKey: sourceKey(),
+        consent: "granted",
+        experiences: experienceOptions({ renderMode: "manual" }),
+      },
+      new AnalyticsTransport(),
+    );
+    clients.push(client);
+    const available = vi.fn();
+    client.onExperienceAvailable(available);
+
+    await client.setExperienceConsent("contextual");
+    await client.page("Checkout");
+
+    expect(available).not.toHaveBeenCalled();
+    expect(client.getExperienceDiagnostics().lastErrorCode).toBe(
+      "EXPERIENCE_MANIFEST_SOURCE_MISMATCH",
+    );
+  });
+
   it("requires an explicit profile-consent signal for personalized Experiences", async () => {
     const profileConsentSignals: boolean[] = [];
     vi.stubGlobal(
@@ -413,11 +445,150 @@ describe("Web Experiences", () => {
     });
 
     await client.setProfileConsent(true);
+    await expect(client.setExperienceConsent("personalized")).resolves.toEqual({
+      accepted: false,
+      reason: "profile_identity_required",
+    });
+    await client.identify("customer_1842");
+    await client.flush();
     await expect(client.setExperienceConsent("personalized")).resolves.toEqual({ accepted: true });
     expect(profileConsentSignals).toEqual([true]);
 
     await client.setProfileConsent(false);
     expect(client.getExperienceDiagnostics().consent).toBe("pending");
+  });
+
+  it("requires a collector-accepted identity binding before personalized evaluation", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        if (requestUrl(input).endsWith("/experiences/v1/bootstrap")) {
+          return jsonResponse(bootstrapFixture());
+        }
+        if (requestUrl(input).endsWith("/experiences/v1/decide")) {
+          return jsonResponse({ decisions: [], serverTime: new Date().toISOString() });
+        }
+        const body = JSON.parse(requestBody(init)) as {
+          interactions: Array<{ clientInteractionId: string }>;
+        };
+        return jsonResponse({
+          accepted: body.interactions.map((item) => item.clientInteractionId),
+          duplicates: [],
+          rejected: [],
+        });
+      }),
+    );
+    const client = new WtsClientImpl(
+      {
+        sourceKey: sourceKey(),
+        consent: "granted",
+        experiences: experienceOptions({ renderMode: "manual" }),
+      },
+      new AnalyticsTransport(),
+    );
+    clients.push(client);
+
+    await client.setProfileConsent(true);
+    await expect(client.setExperienceConsent("personalized")).resolves.toEqual({
+      accepted: false,
+      reason: "profile_identity_required",
+    });
+    await client.identify("customer_1842");
+    await client.flush();
+    await expect(client.setExperienceConsent("personalized")).resolves.toEqual({ accepted: true });
+    await client.page("Checkout");
+  });
+
+  it("consumes the two-overlay session cap at presentation, not at impression", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = requestUrl(input);
+        if (url.endsWith("/experiences/v1/bootstrap")) {
+          return jsonResponse(bootstrapFixture({ campaignCount: 3 }));
+        }
+        const body = JSON.parse(requestBody(init)) as {
+          interactions: Array<{ clientInteractionId: string }>;
+        };
+        return jsonResponse({
+          accepted: body.interactions.map((item) => item.clientInteractionId),
+          duplicates: [],
+          rejected: [],
+        });
+      }),
+    );
+    const client = new WtsClientImpl(
+      {
+        sourceKey: sourceKey(),
+        consent: "granted",
+        experiences: experienceOptions({ renderMode: "manual" }),
+      },
+      new AnalyticsTransport(),
+    );
+    clients.push(client);
+    const available = vi.fn<ExperienceAvailableHandler>();
+    client.onExperienceAvailable(available);
+
+    await client.setExperienceConsent("contextual");
+    await client.page("Checkout");
+    expect(available).toHaveBeenCalledTimes(1);
+
+    const first = available.mock.calls[0]![0];
+    await expect(client.acknowledgeExperienceRender(first.handle)).resolves.toMatchObject({
+      accepted: true,
+    });
+    // No impression is reported; this still counts as a presented overlay.
+    await expect(client.dismissExperience(first.handle)).resolves.toMatchObject({ accepted: true });
+    await new Promise((resolve) => setTimeout(resolve, 3_050));
+
+    const second = available.mock.calls[1]![0];
+    await expect(client.acknowledgeExperienceRender(second.handle)).resolves.toMatchObject({
+      accepted: true,
+    });
+    await expect(client.dismissExperience(second.handle)).resolves.toMatchObject({
+      accepted: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 3_050));
+
+    expect(available).toHaveBeenCalledTimes(2);
+    expect(client.getExperienceDiagnostics().queued).toBe(0);
+  }, 10_000);
+
+  it("rejects executable URL schemes even if a bypassed configuration tries to allow one", () => {
+    const runtime = new ExperienceRuntime({
+      sourceKey: sourceKey(),
+      collectorOrigin: "https://collect.wts.is",
+      timeoutMs: 2_000,
+      debug: false,
+      options: {
+        enabled: true,
+        renderMode: "manual",
+        manifestVerificationKeys,
+        allowedInternalRoutes: [],
+        allowedCallbackKeys: [],
+        allowedDeepLinkHosts: [],
+        // Deliberately bypasses validateOptions: runtime policy must still
+        // reject script and local-resource schemes from a malicious manifest.
+        allowedDeepLinkSchemes: ["javascript", "data", "file"],
+        allowedWebOrigins: [],
+      },
+      getAnalyticsConsent: () => "granted",
+      getProfileConsent: () => true,
+      getProfileIdentityReady: () => true,
+      getIdentity: () => ({ anonymousId: "anonymous", sessionId: "session" }),
+      getStorage: () => undefined,
+      flushIdentity: async () => undefined,
+    });
+    const actionAllowed = (
+      runtime as unknown as {
+        isActionAllowed(action: { type: "OPEN_DEEP_LINK"; target: string }): boolean;
+      }
+    ).isActionAllowed.bind(runtime);
+
+    expect(actionAllowed({ type: "OPEN_DEEP_LINK", target: "javascript:alert(1)" })).toBe(false);
+    expect(actionAllowed({ type: "OPEN_DEEP_LINK", target: "data:text/html,unsafe" })).toBe(false);
+    expect(actionAllowed({ type: "OPEN_DEEP_LINK", target: "file:///etc/passwd" })).toBe(false);
+    runtime.destroy();
   });
 
   it("never invokes manual callbacks in automatic mode and aborts a delayed render on consent denial", async () => {
@@ -552,12 +723,19 @@ describe("Web Experiences", () => {
 });
 
 function bootstrapFixture(
-  options: { delaySeconds?: number; rawManifest?: unknown; secondaryCampaign?: boolean } = {},
+  options: {
+    delaySeconds?: number;
+    rawManifest?: unknown;
+    secondaryCampaign?: boolean;
+    campaignCount?: number;
+    sourceKey?: string;
+  } = {},
 ) {
   const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
   const manifest: ExperienceManifest = {
     schemaVersion: 1,
     sourceId: "source_1",
+    sourceKey: options.sourceKey ?? sourceKey(),
     sourceManifestVersion: 7,
     generatedAt: new Date().toISOString(),
     expiresAt,
@@ -616,15 +794,20 @@ function bootstrapFixture(
       },
     ],
   };
-  if (options.secondaryCampaign) {
+  const extraCampaigns = options.campaignCount
+    ? Math.max(0, options.campaignCount - 1)
+    : options.secondaryCampaign
+      ? 1
+      : 0;
+  for (let index = 0; index < extraCampaigns; index += 1) {
     const first = manifest.campaigns[0]!;
     manifest.campaigns.push({
       ...structuredClone(first),
-      campaignId: "campaign_2",
-      campaignVersionId: "version_2",
-      priority: 5,
+      campaignId: `campaign_${index + 2}`,
+      campaignVersionId: `version_${index + 2}`,
+      priority: 5 - index,
       assignment: {
-        assignmentId: "assignment_2",
+        assignmentId: `assignment_${index + 2}`,
         kind: "variant",
         variantId: "variant_1",
       },
@@ -672,7 +855,7 @@ function requestBody(init?: RequestInit): string {
 }
 
 function sourceKey() {
-  return `web_${crypto.randomUUID().replace(/-/g, "")}`;
+  return "web_test_source_12345678";
 }
 
 function availableExperienceFixture(options: { delaySeconds?: number } = {}): QueuedExperience {
