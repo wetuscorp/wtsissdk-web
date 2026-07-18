@@ -81,7 +81,6 @@ export class WtsClientImpl implements WtsClient {
   private testSession: TestSessionRuntime | undefined;
   private testSessionLoading: Promise<TestSessionRuntime> | undefined;
   private readonly testSessionInput: TestSessionRuntimeInput;
-  private readonly testSessionMayBePersisted: boolean;
 
   constructor(
     options: WtsClientOptions,
@@ -118,11 +117,12 @@ export class WtsClientImpl implements WtsClient {
       experiencesEnabled: () => this.options.experiences.enabled,
       ...(testSessionTransport ? { transport: testSessionTransport } : {}),
     };
-    this.testSessionMayBePersisted = hasPersistedTestSession(this.options.sourceKey);
-    if (this.testSessionMayBePersisted) void this.ensureTestSession();
     this.attributionToken = captureAttributionToken();
     this.installLifecycleListeners();
-    if (this.consent === "granted") void this.startEnable();
+    if (this.consent === "granted") {
+      this.resumePersistedTestSession();
+      void this.startEnable();
+    }
     if (this.consent === "denied") this.attributionToken = undefined;
   }
 
@@ -157,6 +157,7 @@ export class WtsClientImpl implements WtsClient {
     }
     const wasGranted = this.consent === "granted";
     this.consent = "granted";
+    this.resumePersistedTestSession();
     if (!wasGranted || !this.storage) await this.startEnable();
     this.observeTestSession((session) => session.observeConsent());
   }
@@ -307,10 +308,11 @@ export class WtsClientImpl implements WtsClient {
   }
 
   async leaveTestSession(): Promise<{ accepted: boolean }> {
-    const session =
-      this.testSession ??
-      (this.testSessionMayBePersisted ? await this.ensureTestSession() : undefined);
-    return session ? session.leave() : { accepted: true };
+    // Leaving is an explicit caller action, so it may restore a persisted test
+    // session even when analytics consent has not yet been granted. In contrast,
+    // construction and normal SDK operations must not touch storage while consent
+    // is pending.
+    return (await this.ensureTestSession()).leave();
   }
 
   async probeTestSessionUrl(url: string): Promise<TestSessionProbeResult> {
@@ -397,6 +399,19 @@ export class WtsClientImpl implements WtsClient {
       });
     }
     return this.testSessionLoading;
+  }
+
+  private resumePersistedTestSession(): void {
+    if (
+      this.destroyed ||
+      this.consent !== "granted" ||
+      this.testSession ||
+      this.testSessionLoading ||
+      !hasPersistedTestSession(this.options.sourceKey)
+    ) {
+      return;
+    }
+    void this.ensureTestSession();
   }
 
   private observeTestSession(callback: (session: TestSessionRuntime) => void): void {
