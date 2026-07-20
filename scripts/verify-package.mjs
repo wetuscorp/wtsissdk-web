@@ -51,10 +51,10 @@ await writeFile(
   `${experiencesSri}\n`,
   "utf8",
 );
-if (!iife.includes("wtsWebExperiencesIntegrity") || !iife.includes("integrity")) {
-  throw new Error("The primary IIFE must pass a pinned Experiences SRI value to its loader.");
+if (!iife.includes(experiencesSri) || !iife.includes("integrity")) {
+  throw new Error("The primary IIFE must embed the exact Experiences companion SRI value.");
 }
-await verifyIifeTestSessionFacade(iife, testSessionIife);
+await verifyIifeTestSessionFacade(iife, testSessionIife, experiencesIife);
 await verifyIifeExperiencesIntegrity(iife, experiencesIife, experiencesSri);
 
 const esm = await import(new URL("../dist/index.js", import.meta.url).href);
@@ -65,7 +65,7 @@ if (typeof esm.createWtsClient !== "function" || typeof cjs.createWtsClient !== 
 
 console.log(`Package verified: ${gzipBytes} gzip bytes; SRI ${sri}.`);
 
-async function verifyIifeTestSessionFacade(iifeSource, testSessionSource) {
+async function verifyIifeTestSessionFacade(iifeSource, testSessionSource, experienceSource) {
   const requests = [];
   const window = {
     addEventListener() {},
@@ -82,7 +82,13 @@ async function verifyIifeTestSessionFacade(iifeSource, testSessionSource) {
     head: {
       append(script) {
         document.currentScript = script;
-        vm.runInContext(testSessionSource.toString(), context);
+        if (script.dataset.wtsWebExperiences) {
+          vm.runInContext(experienceSource.toString(), context);
+        } else if (script.dataset.wtsWebTestSession) {
+          vm.runInContext(testSessionSource.toString(), context);
+        } else {
+          throw new Error("Unexpected companion script.");
+        }
         script.onload?.();
       },
     },
@@ -91,7 +97,13 @@ async function verifyIifeTestSessionFacade(iifeSource, testSessionSource) {
     const path = new URL(url).pathname;
     const body = JSON.parse(init.body);
     requests.push(path);
-    if (path === "/test/v1/pair") {
+    if (path === "/v3/bootstrap") {
+      return jsonResponse({ attributionContextId: null, serverTime: futureIso() });
+    }
+    if (path === "/experiences/v2/bootstrap") {
+      return jsonResponse({});
+    }
+    if (path === "/sdk/test/v2/pair") {
       return jsonResponse({
         session: { id: "session_package_test", status: "running", expiresAt: futureIso() },
         participant: {
@@ -102,20 +114,20 @@ async function verifyIifeTestSessionFacade(iifeSource, testSessionSource) {
         },
         sessionToken: "t".repeat(32),
         testProfile: { externalUserId: "test_profile_package" },
-        requiredSdkVersion: "0.4.0-alpha.1",
+        requiredSdkVersion: "0.5.0-alpha.1",
         testPlan: emptyTestPlan(),
       });
     }
-    if (path === "/test/v1/handshake") {
+    if (path === "/sdk/test/v2/handshake") {
       return jsonResponse({
         accepted: true,
         compatible: true,
-        requiredSdkVersion: "0.4.0-alpha.1",
+        requiredSdkVersion: "0.5.0-alpha.1",
         checks: [],
         testPlan: emptyTestPlan(),
       });
     }
-    if (path === "/test/v1/signals/batch") {
+    if (path === "/sdk/test/v2/signals/batch") {
       return jsonResponse({
         accepted: body.signals.map((signal) => signal.clientSignalId),
         duplicates: [],
@@ -129,11 +141,13 @@ async function verifyIifeTestSessionFacade(iifeSource, testSessionSource) {
     URL,
     crypto: globalThis.crypto,
     clearTimeout,
+    clearInterval,
     console,
     document,
     fetch,
     queueMicrotask,
     setTimeout,
+    setInterval,
     window,
   };
   sandbox.globalThis = sandbox;
@@ -142,15 +156,15 @@ async function verifyIifeTestSessionFacade(iifeSource, testSessionSource) {
 
   const client = window.WtsWeb.createWtsClient({
     sourceKey: "web_package_test",
-    consent: "pending",
   });
+  await client.setConsent("granted");
   for (const method of ["joinTestSession", "leaveTestSession", "getTestSessionDiagnostics"]) {
     if (typeof client[method] !== "function") {
       throw new Error(`The primary IIFE client does not expose ${method}.`);
     }
   }
   const result = await client.joinTestSession("A2B3C4D5E6F7G8H9");
-  if (!result.joined || !result.compatible || !requests.includes("/test/v1/handshake")) {
+  if (!result.joined || !result.compatible || !requests.includes("/sdk/test/v2/handshake")) {
     throw new Error("The primary IIFE could not lazy-load the SDK Test & Validate companion.");
   }
   const diagnostics = client.getTestSessionDiagnostics();
@@ -178,7 +192,7 @@ async function verifyIifeExperiencesIntegrity(iifeSource, experienceSource, expe
   const document = {
     currentScript: {
       src: "https://cdn.example.test/wts-web.iife.min.js",
-      dataset: { wtsWebExperiencesIntegrity: experienceSri },
+      dataset: {},
     },
     scripts: [],
     addEventListener() {},
@@ -203,7 +217,7 @@ async function verifyIifeExperiencesIntegrity(iifeSource, experienceSource, expe
     if (path === "/v3/bootstrap") {
       return jsonResponse({ attributionContextId: null, serverTime: futureIso() });
     }
-    if (path === "/experiences/v1/bootstrap") {
+    if (path === "/experiences/v2/bootstrap") {
       // The loader is the subject of this check. An untrusted response still
       // exercises fail-closed manifest handling after the SRI-checked load.
       return jsonResponse({
@@ -223,12 +237,14 @@ async function verifyIifeExperiencesIntegrity(iifeSource, experienceSource, expe
     TextEncoder,
     atob,
     clearTimeout,
+    clearInterval,
     console,
     crypto: globalThis.crypto,
     document,
     fetch,
     queueMicrotask,
     setTimeout,
+    setInterval,
     window,
   };
   sandbox.globalThis = sandbox;
@@ -237,11 +253,8 @@ async function verifyIifeExperiencesIntegrity(iifeSource, experienceSource, expe
 
   const client = window.WtsWeb.createWtsClient({
     sourceKey: "web_package_experience_test",
-    consent: "pending",
-    experiences: { enabled: true, renderMode: "manual" },
   });
   await client.setConsent("granted");
-  await client.setExperienceConsent("contextual");
   if (!injectedExperienceScript) {
     throw new Error("The primary IIFE did not load the Experiences companion when enabled.");
   }

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WtsClientImpl } from "../src/client";
 import type {
@@ -43,7 +43,7 @@ class FakeTestSessionTransport implements TestSessionTransport {
       },
       sessionToken: "a".repeat(32),
       testProfile: { externalUserId: "test_profile_123" },
-      requiredSdkVersion: "0.4.0-alpha.1",
+      requiredSdkVersion: "0.5.0-alpha.1",
       testPlan: testPlan(),
     };
   }
@@ -53,7 +53,7 @@ class FakeTestSessionTransport implements TestSessionTransport {
     return {
       accepted: true,
       compatible: this.compatible,
-      requiredSdkVersion: "0.4.0-alpha.1",
+      requiredSdkVersion: "0.5.0-alpha.1",
       checks: [
         {
           key: "sdk_version",
@@ -89,6 +89,8 @@ class FakeTestSessionTransport implements TestSessionTransport {
     return {
       outcome: this.experienceOutcome,
       reason: this.experienceOutcome === "ready" ? null : "TEST_FIXTURE_NOT_ELIGIBLE",
+      renderMode: "automatic",
+      queue: "isolated_test",
       testGrant:
         this.experienceOutcome === "ready"
           ? { fixtureId: "fixture_123", expiresAt: futureIso() }
@@ -100,7 +102,18 @@ class FakeTestSessionTransport implements TestSessionTransport {
               campaignVersionId: "version_123",
               placement: "modal",
               defaultLocale: "en",
-              variant: { id: "variant_123", key: "control", content: {}, asset: null },
+              variant: {
+                id: "variant_123",
+                key: "control",
+                content: {
+                  translations: { en: { title: "Test", description: "Isolated" } },
+                  closeable: true,
+                  themePreset: "light",
+                  delaySeconds: 0,
+                  autoCloseSeconds: null,
+                },
+                asset: null,
+              },
             }
           : null,
     } as Awaited<ReturnType<TestSessionTransport["decideExperience"]>>;
@@ -115,20 +128,29 @@ class FakeTestSessionTransport implements TestSessionTransport {
 describe("SDK Test & Validate session", () => {
   const clients: WtsClientImpl[] = [];
 
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("{}", { status: 503 })),
+    );
+  });
+
   afterEach(() => {
     for (const client of clients) client.destroy();
     clients.length = 0;
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it("is strictly opt-in and sends only sanitized observations after pairing", async () => {
     const testTransport = new FakeTestSessionTransport();
     const client = new WtsClientImpl(
-      { sourceKey: uniqueSource(), consent: "granted" },
+      { sourceKey: uniqueSource() },
       new AnalyticsTransport(),
       testTransport,
     );
     clients.push(client);
+    await client.setConsent("granted");
 
     await client.track(
       "checkout_started",
@@ -147,7 +169,7 @@ describe("SDK Test & Validate session", () => {
       deeplink: false,
       identity: true,
       screen: false,
-      experiences: false,
+      experiences: true,
       offlineQueue: true,
     });
 
@@ -176,11 +198,12 @@ describe("SDK Test & Validate session", () => {
     const testTransport = new FakeTestSessionTransport();
     testTransport.compatible = false;
     const client = new WtsClientImpl(
-      { sourceKey: uniqueSource(), consent: "granted" },
+      { sourceKey: uniqueSource() },
       new AnalyticsTransport(),
       testTransport,
     );
     clients.push(client);
+    await client.setConsent("granted");
 
     const joined = await client.joinTestSession("A2B3C4D5E6F7G8H9");
     await client.track("checkout_started", { cart_total: 749.9 });
@@ -195,19 +218,17 @@ describe("SDK Test & Validate session", () => {
   it("restores a persisted test session only after analytics consent is granted", async () => {
     const sourceKey = uniqueSource();
     const firstTransport = new FakeTestSessionTransport();
-    const firstClient = new WtsClientImpl(
-      { sourceKey, consent: "granted" },
-      new AnalyticsTransport(),
-      firstTransport,
-    );
+    const firstClient = new WtsClientImpl({ sourceKey }, new AnalyticsTransport(), firstTransport);
     clients.push(firstClient);
+    await firstClient.setConsent("granted");
     await firstClient.joinTestSession("A2B3C4D5E6F7G8H9");
     firstClient.destroy();
+    localStorage.clear();
 
     const restoredTransport = new FakeTestSessionTransport();
     const getItem = vi.spyOn(sessionStorage, "getItem");
     const restoredClient = new WtsClientImpl(
-      { sourceKey, consent: "pending" },
+      { sourceKey },
       new AnalyticsTransport(),
       restoredTransport,
     );
@@ -237,6 +258,7 @@ describe("SDK Test & Validate session", () => {
       testTransport,
     );
     clients.push(client);
+    await client.setConsent("granted");
 
     await client.joinTestSession("A2B3C4D5E6F7G8H9");
     await expect(
@@ -257,12 +279,12 @@ describe("SDK Test & Validate session", () => {
     const client = new WtsClientImpl(
       {
         sourceKey: uniqueSource(),
-        experiences: { enabled: true, renderMode: "manual" },
       },
       new AnalyticsTransport(),
       testTransport,
     );
     clients.push(client);
+    await client.setConsent("granted");
 
     await client.joinTestSession("A2B3C4D5E6F7G8H9");
     await expect(client.runTestSessionProbes()).resolves.toMatchObject({

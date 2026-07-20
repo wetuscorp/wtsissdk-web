@@ -4,25 +4,17 @@ import type { WtsClient, WtsClientOptions } from "./types";
 export type {
   ConsentState,
   EventProperties,
-  AvailableExperience,
   ExperienceAction,
   ExperienceActionEvent,
   ExperienceActionHandler,
   ExperienceAccentToken,
   ExperienceAccentTokenValue,
-  ExperienceAvailableHandler,
   ExperienceBackgroundToken,
   ExperienceBackgroundTokenValue,
-  ExperienceConsentResult,
-  ExperienceConsentState,
   ExperienceContent,
   ExperienceDiagnostics,
-  ExperienceDismissal,
   ExperienceLocalizedContent,
-  ExperienceOptions,
   ExperiencePlacement,
-  ExperiencePresentationResult,
-  ExperienceRenderMode,
   ExperienceTextToken,
   ExperienceTextTokenValue,
   FlushResult,
@@ -44,7 +36,6 @@ export type {
   WtsClient,
   WtsClientOptions,
   WtsExperience,
-  WtsExperienceManualPresentation,
 } from "./types";
 
 export function createWtsClient(options: WtsClientOptions): WtsClient {

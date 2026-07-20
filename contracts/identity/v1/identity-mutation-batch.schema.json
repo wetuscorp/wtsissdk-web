@@ -20,7 +20,11 @@
         { "type": "string", "maxLength": 2048 },
         { "type": "number" },
         { "type": "boolean" },
-        { "type": "array", "maxItems": 50, "items": { "type": "string", "maxLength": 512 } }
+        {
+          "type": "array",
+          "maxItems": 50,
+          "items": { "type": "string", "maxLength": 512 }
+        }
       ]
     },
     "attributes": {
@@ -48,7 +52,11 @@
       "properties": {
         "set": { "$ref": "#/$defs/attributes" },
         "setOnce": { "$ref": "#/$defs/attributes" },
-        "unset": { "type": "array", "maxItems": 50, "items": { "$ref": "#/$defs/attributeKey" } },
+        "unset": {
+          "type": "array",
+          "maxItems": 50,
+          "items": { "$ref": "#/$defs/attributeKey" }
+        },
         "increment": {
           "type": "object",
           "maxProperties": 50,
@@ -97,8 +105,19 @@
         "clientMutationId": { "type": "string", "format": "uuid" },
         "occurredAt": { "type": "string", "format": "date-time" },
         "identity": { "$ref": "#/$defs/identity" },
-        "type": { "enum": ["identify", "update_user", "reported_attribution", "reset_identity"] },
-        "externalUserId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "type": {
+          "enum": [
+            "identify",
+            "update_user",
+            "reported_attribution",
+            "reset_identity"
+          ]
+        },
+        "externalUserId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
         "attributes": { "$ref": "#/$defs/attributes" },
         "operations": { "$ref": "#/$defs/operations" },
         "attribution": { "$ref": "#/$defs/attribution" },
@@ -114,7 +133,9 @@
           "then": { "required": ["operations"] }
         },
         {
-          "if": { "properties": { "type": { "const": "reported_attribution" } } },
+          "if": {
+            "properties": { "type": { "const": "reported_attribution" } }
+          },
           "then": { "required": ["attribution"] }
         }
       ]

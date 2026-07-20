@@ -4,18 +4,16 @@ import { loadExperienceRuntime } from "../src/experiences/loader.iife";
 
 type ExperienceWindow = Window & {
   __wtsWebAssetBaseUrl?: string;
-  __wtsWebAssetIntegrity?: { experiences?: string };
   __wtsWebExperiencesFactory?: { create: ReturnType<typeof vi.fn> };
   __wtsWebExperiencesLoadProof?: object;
   __wtsWebExperiencesFactoryProof?: object;
 };
 
-const experienceSri = `sha384-${"a".repeat(64)}`;
+const embeddedExperienceSri = `sha384-${"A".repeat(64)}`;
 
 afterEach(() => {
   const host = window as ExperienceWindow;
   delete host.__wtsWebAssetBaseUrl;
-  delete host.__wtsWebAssetIntegrity;
   delete host.__wtsWebExperiencesFactory;
   delete host.__wtsWebExperiencesLoadProof;
   delete host.__wtsWebExperiencesFactoryProof;
@@ -23,9 +21,7 @@ afterEach(() => {
 });
 
 describe("IIFE Experiences loader", () => {
-  it("fails closed without an exact companion SHA-384 pin", async () => {
-    const host = window as ExperienceWindow;
-    host.__wtsWebAssetBaseUrl = "https://cdn.example.test/releases/0.4.0-alpha.1/";
+  it("fails closed when the versioned primary asset base is unavailable", async () => {
     const append = vi.spyOn(document.head, "append");
 
     await expect(loadExperienceRuntime({} as never)).rejects.toThrow(
@@ -36,8 +32,7 @@ describe("IIFE Experiences loader", () => {
 
   it("does not trust a pre-existing unverified companion factory", async () => {
     const host = window as ExperienceWindow;
-    host.__wtsWebAssetBaseUrl = "https://cdn.example.test/releases/0.4.0-alpha.1/";
-    host.__wtsWebAssetIntegrity = { experiences: experienceSri };
+    host.__wtsWebAssetBaseUrl = "https://cdn.example.test/releases/0.5.0-alpha.1/";
     const unverifiedCreate = vi.fn();
     host.__wtsWebExperiencesFactory = { create: unverifiedCreate };
     const append = vi.spyOn(document.head, "append").mockImplementation((...nodes) => {
@@ -56,8 +51,7 @@ describe("IIFE Experiences loader", () => {
 
   it("injects the matching companion with its exact SHA-384 SRI pin", async () => {
     const host = window as ExperienceWindow;
-    host.__wtsWebAssetBaseUrl = "https://cdn.example.test/releases/0.4.0-alpha.1/";
-    host.__wtsWebAssetIntegrity = { experiences: experienceSri };
+    host.__wtsWebAssetBaseUrl = "https://cdn.example.test/releases/0.5.0-alpha.1/";
     const runtime = { marker: "experience-runtime" };
     const create = vi.fn(() => runtime);
     const unverifiedCreate = vi.fn();
@@ -77,9 +71,9 @@ describe("IIFE Experiences loader", () => {
 
     const script = append.mock.calls[0]?.[0] as HTMLScriptElement;
     expect(script.src).toBe(
-      "https://cdn.example.test/releases/0.4.0-alpha.1/wts-web-experiences.iife.min.js",
+      "https://cdn.example.test/releases/0.5.0-alpha.1/wts-web-experiences.iife.min.js",
     );
-    expect(script.integrity).toBe(experienceSri);
+    expect(script.integrity).toBe(embeddedExperienceSri);
     expect(script.crossOrigin).toBe("anonymous");
     expect(script.referrerPolicy).toBe("no-referrer");
     expect(create).toHaveBeenCalledWith({ sourceKey: "web_test_source" });

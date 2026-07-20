@@ -34,15 +34,14 @@ const unsafeDeepLinkSchemes = new Set([
   "wss",
 ]);
 
-export function validateOptions(options: WtsClientOptions): Required<
+export function validateOptions(
+  options: WtsClientOptions,
+): Required<
   Pick<
     WtsClientOptions,
     "sourceKey" | "autoTrackPageViews" | "collectorOrigin" | "requestTimeoutMs" | "debug"
   >
-> & {
-  consent: NonNullable<WtsClientOptions["consent"]>;
-  experiences: Required<NonNullable<WtsClientOptions["experiences"]>>;
-} {
+> {
   if (!sourceKeyPattern.test(options.sourceKey)) {
     throw new TypeError("sourceKey must be a valid wts.is Web App source key.");
   }
@@ -57,96 +56,12 @@ export function validateOptions(options: WtsClientOptions): Required<
   if (!Number.isInteger(timeout) || timeout < 250 || timeout > 30_000) {
     throw new TypeError("requestTimeoutMs must be an integer between 250 and 30000.");
   }
-  const experienceOptions = options.experiences;
-  const manifestVerificationKeys: Record<string, string> = Object.create(null) as Record<
-    string,
-    string
-  >;
-  for (const [keyId, encodedPublicKey] of Object.entries(
-    experienceOptions?.manifestVerificationKeys ?? {},
-  )) {
-    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(keyId)) {
-      throw new TypeError("Experience manifest key IDs must contain 1–32 URL-safe characters.");
-    }
-    if (
-      typeof encodedPublicKey !== "string" ||
-      encodedPublicKey.length === 0 ||
-      encodedPublicKey.length > 4_096 ||
-      !/^[A-Za-z0-9+/_-]+={0,2}$/.test(encodedPublicKey)
-    ) {
-      throw new TypeError(
-        `Experience manifest public key ${keyId} must be base64 or base64url SPKI data.`,
-      );
-    }
-    manifestVerificationKeys[keyId] = encodedPublicKey;
-  }
-  const normalizeStrings = (
-    values: string[] | undefined,
-    maximum: number,
-    field: string,
-  ): string[] => {
-    const result = [...new Set((values ?? []).map((value) => value.trim()).filter(Boolean))];
-    if (result.length > maximum)
-      throw new TypeError(`${field} can contain at most ${maximum} values.`);
-    return result;
-  };
-  const allowedWebOrigins = normalizeStrings(
-    experienceOptions?.allowedWebOrigins,
-    20,
-    "allowedWebOrigins",
-  ).map((value) => {
-    const parsed = new URL(value);
-    if (parsed.protocol !== "https:" && !isLocalhost(parsed.hostname)) {
-      throw new TypeError("Experience web origins must use HTTPS outside localhost.");
-    }
-    return parsed.origin.toLowerCase();
-  });
-  const allowedDeepLinkSchemes = normalizeStrings(
-    experienceOptions?.allowedDeepLinkSchemes,
-    20,
-    "allowedDeepLinkSchemes",
-  ).map((value) => {
-    const normalized = value.toLowerCase().replace(/:$/, "");
-    if (!/^[a-z][a-z0-9+.-]{1,31}$/.test(normalized)) {
-      throw new TypeError(`Invalid deep-link scheme: ${value}`);
-    }
-    if (normalized === "https") {
-      throw new TypeError("Use allowedDeepLinkHosts to allow HTTPS deep links.");
-    }
-    if (unsafeDeepLinkSchemes.has(normalized)) {
-      throw new TypeError(`Unsafe deep-link scheme is not allowed: ${value}`);
-    }
-    return normalized;
-  });
   return {
     sourceKey: options.sourceKey,
-    consent: options.consent ?? "pending",
     autoTrackPageViews: options.autoTrackPageViews ?? false,
     collectorOrigin: collector.origin,
     requestTimeoutMs: timeout,
     debug: options.debug ?? false,
-    experiences: {
-      enabled: experienceOptions?.enabled ?? false,
-      renderMode: experienceOptions?.renderMode ?? "automatic",
-      manifestVerificationKeys,
-      allowedInternalRoutes: normalizeStrings(
-        experienceOptions?.allowedInternalRoutes,
-        100,
-        "allowedInternalRoutes",
-      ),
-      allowedCallbackKeys: normalizeStrings(
-        experienceOptions?.allowedCallbackKeys,
-        100,
-        "allowedCallbackKeys",
-      ),
-      allowedDeepLinkHosts: normalizeStrings(
-        experienceOptions?.allowedDeepLinkHosts,
-        20,
-        "allowedDeepLinkHosts",
-      ).map(normalizeDeepLinkHost),
-      allowedDeepLinkSchemes,
-      allowedWebOrigins,
-    },
   };
 }
 
@@ -245,29 +160,6 @@ export function normalizePathname(pathname: string): string {
 
 function isLocalhost(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
-}
-
-function normalizeDeepLinkHost(value: string): string {
-  const normalized = value.toLowerCase();
-  if (/[/:?#@]/.test(normalized)) {
-    throw new TypeError("Experience deep-link hosts must contain a hostname only.");
-  }
-  try {
-    const parsed = new URL(`https://${normalized}`);
-    if (
-      !parsed.hostname ||
-      parsed.hostname !== normalized ||
-      parsed.port ||
-      parsed.username ||
-      parsed.password
-    ) {
-      throw new TypeError("Experience deep-link hosts must contain a hostname only.");
-    }
-    return parsed.hostname;
-  } catch (error) {
-    if (error instanceof TypeError && error.message.includes("hostname only")) throw error;
-    throw new TypeError("Experience deep-link hosts must contain a valid hostname only.");
-  }
 }
 
 function validateAttributeEntries(entries: Array<[string, unknown]>): void {

@@ -2,13 +2,12 @@
 
 Consent-first browser measurement and deterministic wts.is link attribution. The SDK is dependency-free, safe to import during server rendering, and never collects DOM content, form values, URL queries, fragments, advertising identifiers, or fingerprints.
 
-> `0.4.0-alpha.1` adds signed Experience-manifest verification, explicit
-> profile consent for personalized Experiences, and a manual presentation
-> lifecycle while retaining Web Protocol V3 analytics, identity, deterministic
-> attribution, and SDK Test Session V1 behavior.
+> `0.5.0-alpha.1` adds unified persisted consent, Experiences Protocol V2,
+> automatic deployless campaign delivery, root-signed online key rotation, and
+> SDK Test Session V2 while retaining Web Protocol V3 analytics and identity.
 
 > **Version discipline:** Keep the npm package, versioned IIFE and its two
-> companion artifacts on the same `0.4.0-alpha.1` release. SDK Test & Validate
+> companion artifacts on the same `0.5.0-alpha.1` release. SDK Test & Validate
 > and Experiences deliberately fail closed when their matching companion is
 > unavailable or cannot be verified.
 
@@ -17,7 +16,7 @@ Consent-first browser measurement and deterministic wts.is link attribution. The
 - A Web App created in the wts.is dashboard
 - The page origin included in that Web App's exact allowed-origin list
 - Safari 15+ or the latest two major Chrome, Edge, and Firefox releases
-- A consent-management decision supplied on every page load
+- A one-time consent-management decision supplied by the host
 
 Core analytics supports the browser matrix above. Experiences additionally
 require WebCrypto Ed25519 verification. A browser without that capability
@@ -27,7 +26,7 @@ analytics continues to work normally.
 ## npm installation
 
 ```bash
-npm install @wetusco/wts-web-sdk@0.4.0-alpha.1
+npm install @wetusco/wts-web-sdk@0.5.0-alpha.1
 ```
 
 ```ts
@@ -35,11 +34,10 @@ import { createWtsClient } from "@wetusco/wts-web-sdk";
 
 const wts = createWtsClient({
   sourceKey: "web_public_source_key",
-  consent: "pending",
   autoTrackPageViews: false,
 });
 
-// Call from your CMP callback. Pending sends nothing and opens no storage.
+// Pending sends nothing; first 0.5 startup only reads consent and deletes 0.4 state.
 await wts.setConsent("granted");
 await wts.page("Pricing");
 
@@ -58,15 +56,13 @@ Use a versioned artifact and the SRI value shipped next to it. Do not use an unv
 
 ```html
 <script
-  src="https://cdn.jsdelivr.net/npm/@wetusco/wts-web-sdk@0.4.0-alpha.1/dist/wts-web.iife.min.js"
+  src="https://cdn.jsdelivr.net/npm/@wetusco/wts-web-sdk@0.5.0-alpha.1/dist/wts-web.iife.min.js"
   integrity="<sha384-from-wts-web.iife.min.js.sri>"
   crossorigin="anonymous"
-  data-wts-web-experiences-integrity="<sha384-from-wts-web-experiences.iife.min.js.sri>"
 ></script>
 <script>
   const wts = window.WtsWeb.createWtsClient({
     sourceKey: "web_public_source_key",
-    consent: "pending",
   });
 </script>
 ```
@@ -76,11 +72,9 @@ this release in `dist/wts-web.iife.min.js.sri`.
 The SDK Test & Validate methods remain available on that client. When one is
 called, the SDK loads the matching `wts-web-test-session.iife.min.js` companion
 from the same versioned `dist/` directory. Experiences follows the same model:
-when it is explicitly enabled, the SDK loads
-`wts-web-experiences.iife.min.js`. Set
-`data-wts-web-experiences-integrity` to the exact value in that companion's
-`wts-web-experiences.iife.min.js.sri` file; the IIFE fails closed and does not
-inject the companion if the pin is absent or malformed. The primary and
+after consent is granted, the SDK loads `wts-web-experiences.iife.min.js`.
+The primary IIFE embeds the exact companion SHA-384 pin at build time, so the
+host configures SRI only for the primary script. The primary and
 companion artifacts must come from the same immutable release directory and
 their host must support anonymous CORS for browser SRI verification. Deploy all
 three version-matched artifacts together so these opt-in capabilities remain
@@ -88,10 +82,13 @@ available without inflating the analytics entry bundle.
 
 ## Consent behavior
 
-- `pending` is the default. No network request, identity, storage, or queue is created.
+- `pending` is the default. Only the source-scoped consent marker is read; no
+  event/identity/Experience storage, network request, identity, or queue is
+  opened. The first 0.5 startup deletes 0.4 namespaces without reading or
+  migrating them.
 - `granted` opens the first-party IndexedDB queue and starts delivery.
 - `denied` clears all SDK storage and stops delivery.
-- The SDK does not persist the consent decision. Your CMP must call `setConsent` on each page load.
+- The source-scoped decision is persisted. Use `getConsentState()` to avoid prompting again.
 
 Calls to `page` and `track` while pending or denied return an explicit no-op result. They are never retained in memory for later delivery.
 
@@ -137,68 +134,35 @@ For client-side routers, set `autoTrackPageViews: true`. The SDK observes the in
 
 ## Experiences
 
-Experiences is disabled by default even after upgrading. Enable it explicitly,
-provide action allowlists and pass a separate consent decision on every page
-load:
+Experiences is automatic after unified consent. No manifest key, renderer,
+allowlist, or Experience-specific init setting belongs in the host app:
 
 ```ts
 const wts = createWtsClient({
   sourceKey: "web_public_source_key",
-  consent: "pending",
-  experiences: {
-    enabled: true,
-    renderMode: "automatic",
-    manifestVerificationKeys: {
-      current: "<base64-spki-der-ed25519-public-key>",
-    },
-    allowedInternalRoutes: ["/checkout", "/account"],
-    allowedCallbackKeys: ["apply_offer"],
-    allowedWebOrigins: ["https://www.example.com"],
-    allowedDeepLinkHosts: ["links.example.com"],
-  },
 });
 
 await wts.setConsent("granted");
-await wts.setExperienceConsent("contextual");
 await wts.page("Checkout");
 ```
 
-Fetch the public verification-key ring through the authenticated workspace API:
-
-```text
-GET /api/v1/organizations/:organizationId/experiences/manifest-verification-keys
-```
-
-Each value is a base64 SPKI DER Ed25519 **public** key, indexed by `kid`. Pin
-the returned public keys in your deployment configuration and retain an
-overlap during rotation. Never derive, export, copy, or configure a private
-signing key in a browser or application source tree. A missing matching key or
-an invalid signature fails closed and no Experience is presented.
-
-Use `personalized` only after an explicit profile-consent signal and an
-`identify()` mutation has been accepted by the collector. This is a real
-identity-binding gate: the SDK does not treat its anonymous browser identity
-as a known profile. Call `identify()`, await `flush()`, then enable
-personalized Experiences. `setProfileConsent` is an in-memory Experience
-permission; it does not retroactively gate or change analytics and identity
-methods. `pending` makes no Experience request. `denied` removes cached
-manifest, assignment and unsent interaction data.
+The SDK verifies a root-signed online Ed25519 keyset and then the source-bound
+manifest. Online keys rotate without an application deploy. Cached contextual
+campaigns are usable offline only until the signed ten-minute expiry. The SDK
+refreshes in foreground every 60 seconds with ETag/single-flight protection.
+An accepted `identify()` binding automatically lets the backend switch later
+decisions from contextual to personalized; there is no second consent API.
 
 ```ts
 await wts.setConsent("granted");
-await wts.setProfileConsent(true); // Call on every page load from your CMP/privacy flow.
 await wts.identify("customer_1842");
-await wts.flush(); // Personalized Experiences require a collector-accepted binding.
-await wts.setExperienceConsent("personalized");
 await wts.page("Checkout");
 ```
 
-Automatic mode loads the accessible Shadow DOM renderer only when a campaign
-is eligible. Manual mode does not create SDK UI. It offers only the next queued
-candidate once through `onExperienceAvailable`, with an opaque handle that is
-valid only for that presentation. `presentNextExperience()` is automatic-mode
-only and returns `false` in manual mode. Use `onExperienceAction` for
-allowlisted application callbacks. At most one experience is visible and the
+The accessible Shadow DOM renderer loads only when a campaign is eligible.
+Use `onExperienceAction` only for an internal route or custom callback. Return
+`true` when handled. Missing, failed, or false handlers are measured as
+`unhandled` and leave the Experience open. At most one experience is visible and the
 local candidate queue is bounded to five. A session can admit at most two
 overlay presentations (modal, slide-in, or bottom sheet), even if a user
 dismisses one before it qualifies as an impression.
@@ -233,40 +197,10 @@ const unsubscribe = wts.onExperienceAction(async ({ action }) => {
   return false;
 });
 
-await wts.presentNextExperience();
+// Emergency host control; normal delivery is automatic.
 await wts.dismissCurrentExperience();
 console.log(wts.getExperienceDiagnostics());
 unsubscribe();
-```
-
-For manual rendering, report only real lifecycle transitions. Repeating an
-accepted transition returns `{ accepted: true, idempotent: true }`; the handle
-does not expose campaign grants or the exposure identifier in the experience
-payload. `onExperienceAvailable` may be `async`; an unhandled synchronous or
-asynchronous renderer failure is contained and reported as
-`EXPERIENCE_MANUAL_HANDLER_FAILED` in diagnostics instead of becoming an
-unhandled promise rejection.
-
-```ts
-const unsubscribeManual = wts.onExperienceAvailable(async ({ experience, handle }) => {
-  try {
-    // Mount the host UI before acknowledging a successful render.
-    showYourOwnModal(experience);
-    await wts.acknowledgeExperienceRender(handle);
-
-    // Report this only after the modal is at least visibly presented.
-    await wts.acknowledgeExperienceImpression(handle);
-
-    // Report only actions the user actually performed.
-    await wts.reportExperienceAction(handle, "primary");
-    await wts.dismissExperience(handle, { reason: "dismissed" });
-  } catch {
-    // A renderer failure is reported without treating it as an impression.
-    await wts.dismissExperience(handle, { failureCode: "HOST_RENDER_FAILED" });
-  }
-});
-
-unsubscribeManual();
 ```
 
 The verified manifest expiry also applies to candidates already waiting in the
@@ -322,17 +256,12 @@ Inspect the isolated session and run only the dashboard-selected plan:
 const diagnostics = wts.getTestSessionDiagnostics();
 const probes = await wts.runTestSessionProbes();
 
-// This is a test-only manual decision; it never enters the normal Experiences
-// renderer and does not generate production interaction events.
-if (probes.experienceDecision?.outcome === "ready") {
-  await presentTestExperiencePreview(probes.experienceDecision);
-  await wts.reportTestSessionExperienceInteraction("impression");
-}
+// A ready test Experience is rendered automatically in an isolated test queue.
+console.log(probes.experienceDecision?.outcome);
 ```
 
-Report `"action"` only after the corresponding real action in that manual
-preview. It is accepted only after a ready isolated decision; normal Experience
-lifecycle signals are never copied to test transport. Use
+Test renderer impressions/actions are sent only to the session; normal
+Experience lifecycle signals are never copied to test transport. Use
 `probeTestSessionUrl(url)` for an event-free resolver check and
 `leaveTestSession()` when the operator finishes. Expiry also clears the
 session.

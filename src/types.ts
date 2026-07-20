@@ -1,6 +1,4 @@
 export type ConsentState = "pending" | "granted" | "denied";
-export type ExperienceConsentState = "pending" | "contextual" | "personalized" | "denied";
-export type ExperienceRenderMode = "automatic" | "manual";
 export type Scalar = string | number | boolean;
 export type EventProperties = Record<string, Scalar>;
 export type UserAttributeValue = Scalar | string[] | Date;
@@ -13,30 +11,10 @@ export interface Revenue {
 
 export interface WtsClientOptions {
   sourceKey: string;
-  consent?: ConsentState;
   autoTrackPageViews?: boolean;
   collectorOrigin?: string;
   requestTimeoutMs?: number;
   debug?: boolean;
-  experiences?: ExperienceOptions;
-}
-
-export interface ExperienceOptions {
-  enabled: boolean;
-  renderMode?: ExperienceRenderMode;
-  /**
-   * Trusted Ed25519 public keys indexed by the signed manifest `kid`.
-   *
-   * Each value is an SPKI DER public key encoded as base64 or base64url. These
-   * are public verification keys, never private signing keys. When no matching
-   * key is configured, the SDK fails closed and does not present Experiences.
-   */
-  manifestVerificationKeys?: Record<string, string>;
-  allowedInternalRoutes?: string[];
-  allowedCallbackKeys?: string[];
-  allowedDeepLinkHosts?: string[];
-  allowedDeepLinkSchemes?: string[];
-  allowedWebOrigins?: string[];
 }
 
 export type ExperiencePlacement =
@@ -111,28 +89,15 @@ export interface WtsExperience {
   assetUrl?: string;
 }
 
-/** @deprecated Use {@link WtsExperience}. */
-export type AvailableExperience = WtsExperience;
-
-/**
- * Delivered only when `renderMode` is `manual`. `handle` is opaque and maps to
- * the single exposure being presented; do not inspect, persist, or derive it.
- */
-export interface WtsExperienceManualPresentation {
-  experience: WtsExperience;
-  handle: string;
-}
-
 export interface ExperienceActionEvent {
   experience: WtsExperience;
   action: ExperienceAction;
-  handled: boolean;
 }
 
 export interface ExperienceDiagnostics {
   enabled: boolean;
-  consent: ExperienceConsentState;
-  renderMode: ExperienceRenderMode;
+  consent: ConsentState;
+  decisionMode: "contextual" | "personalized" | null;
   manifestVersion: number | null;
   manifestExpiresAt: string | null;
   queued: number;
@@ -142,52 +107,9 @@ export interface ExperienceDiagnostics {
   lastErrorCode: string | null;
 }
 
-export interface ExperienceConsentResult {
-  accepted: boolean;
-  reason?:
-    | "feature_disabled"
-    | "analytics_consent_required"
-    | "profile_consent_required"
-    | "profile_identity_required"
-    | "destroyed";
-}
-
-export interface ExperiencePresentationResult {
-  accepted: boolean;
-  /** Whether this repeats an already accepted lifecycle transition. */
-  idempotent: boolean;
-  code?:
-    | "feature_disabled"
-    | "manual_mode_required"
-    | "consent_required"
-    | "manifest_expired"
-    | "presentation_not_found"
-    | "presentation_not_presenting"
-    | "session_overlay_limit_reached"
-    | "already_reported"
-    | "invalid_action"
-    | "invalid_failure_code"
-    | "destroyed";
-}
-
-export interface ExperienceDismissal {
-  /** Defaults to a user dismissal. */
-  reason?: "dismissed" | "auto_closed";
-  /** Optional stable, uppercase diagnostic code supplied by a host renderer. */
-  failureCode?: string;
-}
-
 export type ExperienceActionHandler = (
   event: ExperienceActionEvent,
 ) => void | boolean | Promise<void | boolean>;
-/**
- * Manual render handlers may complete asynchronously. Rejections are captured
- * by the SDK and surfaced through Experience diagnostics; they never become
- * unhandled promise rejections.
- */
-export type ExperienceAvailableHandler = (
-  presentation: WtsExperienceManualPresentation,
-) => void | Promise<void>;
 
 export interface OperationResult {
   accepted: boolean;
@@ -202,12 +124,7 @@ export interface FlushResult {
 
 export interface WtsClient {
   setConsent(consent: "granted" | "denied"): Promise<void>;
-  /**
-   * Records the host application's current profile-consent decision in memory.
-   * The SDK never persists consent; call this on each page load before using
-   * personalized Experiences.
-   */
-  setProfileConsent(granted: boolean): Promise<void>;
+  getConsentState(): ConsentState;
   page(name?: string): Promise<OperationResult>;
   track(
     eventKey: string,
@@ -218,22 +135,8 @@ export interface WtsClient {
   updateUser(operations: UserUpdateOperations): Promise<OperationResult>;
   setReportedAttribution(attribution: ReportedAttribution): Promise<OperationResult>;
   resetIdentity(): Promise<OperationResult>;
-  setExperienceConsent(consent: ExperienceConsentState): Promise<ExperienceConsentResult>;
   onExperienceAction(handler: ExperienceActionHandler): () => void;
-  onExperienceAvailable(handler: ExperienceAvailableHandler): () => void;
-  acknowledgeExperienceRender(handle: string): Promise<ExperiencePresentationResult>;
-  acknowledgeExperienceImpression(handle: string): Promise<ExperiencePresentationResult>;
-  reportExperienceAction(handle: string, actionId: string): Promise<ExperiencePresentationResult>;
-  dismissExperience(
-    handle: string,
-    outcome?: ExperienceDismissal,
-  ): Promise<ExperiencePresentationResult>;
-  /** @deprecated Use dismissExperience(handle, { failureCode }) instead. */
-  failExperiencePresentation(
-    handle: string,
-    failureCode: string,
-  ): Promise<ExperiencePresentationResult>;
-  presentNextExperience(): Promise<boolean>;
+  /** Emergency host control; normal presentation is always automatic. */
   dismissCurrentExperience(): Promise<boolean>;
   getExperienceDiagnostics(): ExperienceDiagnostics;
   joinTestSession(pairing: TestSessionPairing): Promise<TestSessionJoinResult>;
@@ -344,6 +247,8 @@ export type TestSessionExperienceContext =
 export interface TestSessionExperienceDecision {
   outcome: "ready" | "holdout" | "not_eligible" | "blocked";
   reason: string | null;
+  renderMode: "automatic";
+  queue: "isolated_test";
   testGrant: { fixtureId: string; expiresAt: string } | null;
   decision: {
     campaignId: string;
@@ -364,10 +269,7 @@ export interface TestSessionProbeRunResult {
   emitted: Array<"identity" | "event" | "screen" | "experiences">;
   skipped: Array<"identity" | "event" | "screen" | "experiences">;
   pendingSignals: number;
-  /**
-   * An isolated test-only decision. It is never added to the production
-   * Experiences runtime or rendered automatically.
-   */
+  /** An isolated test-only decision rendered outside the production queue. */
   experienceDecision?: TestSessionExperienceDecision;
 }
 
@@ -401,7 +303,7 @@ export interface TestSessionTransport {
   pair(
     sourceKey: string,
     input: {
-      schemaVersion: 1;
+      schemaVersion: 2;
       pairingToken?: string;
       pairingCode?: string;
       metadata: TestSessionMetadata;
@@ -422,7 +324,7 @@ export interface TestSessionTransport {
   handshake(
     sourceKey: string,
     input: {
-      schemaVersion: 1;
+      schemaVersion: 2;
       participantId: string;
       sessionToken: string;
       metadata: TestSessionMetadata;
@@ -433,11 +335,7 @@ export interface TestSessionTransport {
         experiences: boolean;
         offlineQueue: boolean;
       };
-      consent: {
-        analytics: ConsentState;
-        profile?: boolean;
-        experience?: ExperienceConsentState;
-      };
+      consent: ConsentState;
     },
   ): Promise<{
     accepted: boolean;
@@ -449,7 +347,7 @@ export interface TestSessionTransport {
   signals(
     sourceKey: string,
     input: {
-      schemaVersion: 1;
+      schemaVersion: 2;
       participantId: string;
       sessionToken: string;
       signals: TestSessionSignal[];
@@ -461,12 +359,12 @@ export interface TestSessionTransport {
   }>;
   resolve(
     sourceKey: string,
-    input: { schemaVersion: 1; participantId: string; sessionToken: string; url: string },
+    input: { schemaVersion: 2; participantId: string; sessionToken: string; url: string },
   ): Promise<TestSessionProbeResult>;
   decideExperience(
     sourceKey: string,
     input: {
-      schemaVersion: 1;
+      schemaVersion: 2;
       participantId: string;
       sessionToken: string;
       context: TestSessionExperienceContext;
@@ -474,7 +372,7 @@ export interface TestSessionTransport {
   ): Promise<TestSessionExperienceDecision>;
   leave(
     sourceKey: string,
-    input: { schemaVersion: 1; participantId: string; sessionToken: string },
+    input: { schemaVersion: 2; participantId: string; sessionToken: string },
   ): Promise<{ accepted: boolean }>;
 }
 
@@ -574,6 +472,31 @@ export interface StoredState {
   queue: WebEvent[];
   identityQueue: IdentityMutation[];
   experienceQueue: StoredExperienceInteraction[];
+  experienceManifest?: StoredExperienceManifest;
+  experienceImpressions?: Record<string, string[]>;
+}
+
+export interface StoredExperienceManifest {
+  signedPayload: string;
+  signature: string;
+  keyId: string;
+  expiresAt: string;
+  etag?: string;
+  cachedAt: string;
+  onlineKeyset: {
+    version: number;
+    issuedAt: string;
+    expiresAt: string;
+    keys: Array<{
+      keyId: string;
+      algorithm: "Ed25519";
+      publicKey: string;
+      notBefore: string;
+      expiresAt: string;
+    }>;
+    signedPayload: string;
+    rootSignature: string;
+  };
 }
 
 export interface StoredExperienceInteraction {
@@ -598,6 +521,7 @@ export interface StoredExperienceInteraction {
     | "dismissed"
     | "auto_closed";
   actionId: string | null;
+  actionOutcome: "handled" | "unhandled" | null;
   triggerEventId: string | null;
   occurredAt: string;
   metadata: {
@@ -615,6 +539,8 @@ export interface StorageAdapter {
   enqueue(event: WebEvent): Promise<void>;
   enqueueIdentity(mutation: IdentityMutation): Promise<void>;
   enqueueExperience(interaction: StoredExperienceInteraction): Promise<void>;
+  saveExperienceManifest(manifest?: StoredExperienceManifest): Promise<void>;
+  recordExperienceImpression(campaignVersionId: string, occurredAt: string): Promise<void>;
   remove(clientEventIds: ReadonlySet<string>): Promise<void>;
   removeIdentity(clientMutationIds: ReadonlySet<string>): Promise<void>;
   removeExperiences(clientInteractionIds: ReadonlySet<string>): Promise<void>;

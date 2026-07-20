@@ -8,7 +8,11 @@
       "sessionId": "952339a6-b7ba-46bc-a7cb-0471fa39356f",
       "type": "page_view",
       "occurredAt": "2026-07-16T10:00:01.000Z",
-      "metadata": { "platform": "web", "sdkVersion": "0.2.0-alpha.1", "locale": "tr-TR" },
+      "metadata": {
+        "platform": "web",
+        "sdkVersion": "0.2.0-alpha.1",
+        "locale": "tr-TR"
+      },
       "pathname": "/pricing",
       "pageName": "Pricing",
       "referrerHost": "www.google.com",
@@ -22,7 +26,11 @@
       "type": "custom",
       "eventKey": "purchase",
       "occurredAt": "2026-07-16T10:00:05.000Z",
-      "metadata": { "platform": "web", "sdkVersion": "0.2.0-alpha.1", "locale": "tr-TR" },
+      "metadata": {
+        "platform": "web",
+        "sdkVersion": "0.2.0-alpha.1",
+        "locale": "tr-TR"
+      },
       "properties": { "plan": "enterprise", "member": true },
       "revenue": { "amount": "1490.50", "currency": "TRY" }
     }

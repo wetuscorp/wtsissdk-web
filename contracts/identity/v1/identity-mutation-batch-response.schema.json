@@ -5,8 +5,14 @@
   "additionalProperties": false,
   "required": ["accepted", "duplicates", "rejected"],
   "properties": {
-    "accepted": { "type": "array", "items": { "type": "string", "format": "uuid" } },
-    "duplicates": { "type": "array", "items": { "type": "string", "format": "uuid" } },
+    "accepted": {
+      "type": "array",
+      "items": { "type": "string", "format": "uuid" }
+    },
+    "duplicates": {
+      "type": "array",
+      "items": { "type": "string", "format": "uuid" }
+    },
     "rejected": {
       "type": "array",
       "items": {

@@ -66,12 +66,17 @@ describe("WtsClient", () => {
 
   beforeEach(() => {
     window.history.replaceState({}, "", "/pricing?campaign=summer#plans");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("{}", { status: 503 })),
+    );
   });
 
   afterEach(() => {
     for (const client of clients) client.destroy();
     clients.length = 0;
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it("does not initialize storage, queue, or network while consent is pending", async () => {
@@ -91,9 +96,13 @@ describe("WtsClient", () => {
     expect(transport.batches).toHaveLength(0);
   });
 
-  it("is ready for an immediate page call when consent is granted in options", async () => {
+  it("restores a persisted grant on a new client", async () => {
     const transport = new FakeTransport();
-    const client = new WtsClientImpl({ sourceKey: uniqueSource(), consent: "granted" }, transport);
+    const sourceKey = uniqueSource();
+    const first = new WtsClientImpl({ sourceKey }, new FakeTransport());
+    await first.setConsent("granted");
+    first.destroy();
+    const client = new WtsClientImpl({ sourceKey }, transport);
     clients.push(client);
 
     await expect(client.page("Pricing")).resolves.toMatchObject({ accepted: true });
@@ -156,9 +165,10 @@ describe("WtsClient", () => {
     const client = new WtsClientImpl({ sourceKey: uniqueSource() }, transport);
     clients.push(client);
 
-    expect(window.location.search).toBe("?campaign=summer");
+    expect(window.location.search).toContain("_wts=signed-token-value");
     expect(window.location.hash).toBe("#plans");
     await client.setConsent("granted");
+    expect(window.location.search).toBe("?campaign=summer");
     await client.page();
     await client.flush();
 
@@ -288,7 +298,7 @@ describe("WtsClient", () => {
     });
     previousStorage.close();
 
-    const client = new WtsClientImpl({ sourceKey, consent: "pending" }, new FakeTransport());
+    const client = new WtsClientImpl({ sourceKey }, new FakeTransport());
     clients.push(client);
     await client.setConsent("denied");
 
@@ -330,7 +340,7 @@ describe("WtsClient", () => {
     const transport = new FakeTransport();
     const originalPush = window.history.pushState;
     const client = new WtsClientImpl(
-      { sourceKey: uniqueSource(), consent: "pending", autoTrackPageViews: true },
+      { sourceKey: uniqueSource(), autoTrackPageViews: true },
       transport,
     );
     clients.push(client);

@@ -32,17 +32,31 @@
           "eventKey": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,63}$" },
           "occurredAt": { "type": "string", "format": "date-time" },
           "metadata": { "$ref": "common.schema.json#/$defs/metadata" },
-          "pathname": { "type": "string", "pattern": "^/[^?#]*$", "maxLength": 2048 },
+          "pathname": {
+            "type": "string",
+            "pattern": "^/[^?#]*$",
+            "maxLength": 2048
+          },
           "pageName": { "type": "string", "maxLength": 120 },
-          "referrerHost": { "type": "string", "pattern": "^[a-z0-9.-]+$", "maxLength": 253 },
+          "referrerHost": {
+            "type": "string",
+            "pattern": "^[a-z0-9.-]+$",
+            "maxLength": 253
+          },
           "properties": {
             "type": "object",
             "maxProperties": 20,
             "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,63}$" },
-            "additionalProperties": { "$ref": "common.schema.json#/$defs/scalar" }
+            "additionalProperties": {
+              "$ref": "common.schema.json#/$defs/scalar"
+            }
           },
           "revenue": { "$ref": "common.schema.json#/$defs/revenue" },
-          "attributionContextId": { "type": "string", "minLength": 8, "maxLength": 128 }
+          "attributionContextId": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 128
+          }
         },
         "allOf": [
           {

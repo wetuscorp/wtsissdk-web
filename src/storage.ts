@@ -4,6 +4,7 @@ import type {
   Identity,
   IdentityMutation,
   StorageAdapter,
+  StoredExperienceManifest,
   StoredExperienceInteraction,
   StoredState,
   WebEvent,
@@ -13,6 +14,8 @@ const META_STORE = "meta";
 const EVENT_STORE = "events";
 const IDENTITY_STORE = "identity_mutations";
 const EXPERIENCE_STORE = "experience_interactions";
+const EXPERIENCE_MANIFEST_META_KEY = "experience_manifest_v2";
+const EXPERIENCE_IMPRESSIONS_META_KEY = "experience_impressions_v2";
 
 export async function createStorage(sourceKey: string): Promise<StorageAdapter> {
   if (typeof indexedDB === "undefined") throw new Error("IndexedDB is unavailable.");
@@ -27,6 +30,12 @@ export async function deleteStorage(sourceKey: string): Promise<void> {
     request.onerror = () => reject(request.error ?? new Error("IndexedDB deletion failed."));
     request.onblocked = () => reject(new Error("IndexedDB deletion was blocked by another tab."));
   });
+}
+
+/** Removes the 0.4 namespace without reading or migrating any legacy state. */
+export async function deleteLegacyStorage(sourceKey: string): Promise<void> {
+  if (typeof indexedDB === "undefined") return;
+  await deleteDatabase(`wts-web-${sourceKey}`);
 }
 
 export class MemoryStorage implements StorageAdapter {
@@ -63,6 +72,20 @@ export class MemoryStorage implements StorageAdapter {
   async enqueueExperience(interaction: StoredExperienceInteraction): Promise<void> {
     this.state.experienceQueue.push(clone(interaction));
     trimQueues(this.state);
+  }
+
+  async saveExperienceManifest(manifest?: StoredExperienceManifest): Promise<void> {
+    if (manifest) this.state.experienceManifest = clone(manifest);
+    else delete this.state.experienceManifest;
+  }
+
+  async recordExperienceImpression(campaignVersionId: string, occurredAt: string): Promise<void> {
+    const cutoff = Date.now() - 24 * 60 * 60_000;
+    const ledger = this.state.experienceImpressions ?? {};
+    ledger[campaignVersionId] = [...(ledger[campaignVersionId] ?? []), occurredAt].filter(
+      (value) => Date.parse(value) > cutoff,
+    );
+    this.state.experienceImpressions = ledger;
   }
 
   async remove(clientEventIds: ReadonlySet<string>): Promise<void> {
@@ -125,6 +148,8 @@ class IndexedDbStorage implements StorageAdapter {
       queue,
       identityQueue,
       experienceQueue,
+      experienceManifest,
+      experienceImpressions,
     ] = await Promise.all([
       requestResult(meta.get("identity") as IDBRequest<Identity | undefined>),
       requestResult(meta.get("attributionContextId") as IDBRequest<string | undefined>),
@@ -132,6 +157,14 @@ class IndexedDbStorage implements StorageAdapter {
       requestResult(events.getAll() as IDBRequest<WebEvent[]>),
       requestResult(mutations.getAll() as IDBRequest<IdentityMutation[]>),
       requestResult(experiences.getAll() as IDBRequest<StoredExperienceInteraction[]>),
+      requestResult(
+        meta.get(EXPERIENCE_MANIFEST_META_KEY) as IDBRequest<StoredExperienceManifest | undefined>,
+      ),
+      requestResult(
+        meta.get(EXPERIENCE_IMPRESSIONS_META_KEY) as IDBRequest<
+          Record<string, string[]> | undefined
+        >,
+      ),
     ]);
     await transactionDone(transaction);
     queue.sort((left, right) => left.occurredAt.localeCompare(right.occurredAt));
@@ -145,6 +178,8 @@ class IndexedDbStorage implements StorageAdapter {
       queue,
       identityQueue,
       experienceQueue,
+      ...(experienceManifest ? { experienceManifest } : {}),
+      ...(experienceImpressions ? { experienceImpressions } : {}),
     };
   }
 
@@ -215,6 +250,24 @@ class IndexedDbStorage implements StorageAdapter {
     transaction.objectStore(EXPERIENCE_STORE).put(interaction);
     await transactionDone(transaction);
     await this.trimPersistentQueues();
+  }
+
+  async saveExperienceManifest(manifest?: StoredExperienceManifest): Promise<void> {
+    const transaction = this.database.transaction(META_STORE, "readwrite");
+    const store = transaction.objectStore(META_STORE);
+    if (manifest) store.put(manifest, EXPERIENCE_MANIFEST_META_KEY);
+    else store.delete(EXPERIENCE_MANIFEST_META_KEY);
+    await transactionDone(transaction);
+  }
+
+  async recordExperienceImpression(campaignVersionId: string, occurredAt: string): Promise<void> {
+    const state = await this.load();
+    const cutoff = Date.now() - 24 * 60 * 60_000;
+    const ledger = state.experienceImpressions ?? {};
+    ledger[campaignVersionId] = [...(ledger[campaignVersionId] ?? []), occurredAt].filter(
+      (value) => Date.parse(value) > cutoff,
+    );
+    await this.writeMeta(EXPERIENCE_IMPRESSIONS_META_KEY, ledger);
   }
 
   async remove(clientEventIds: ReadonlySet<string>): Promise<void> {
@@ -311,5 +364,14 @@ function clone<T>(value: T): T {
 }
 
 function databaseName(sourceKey: string): string {
-  return `wts-web-${sourceKey}`;
+  return `wts-web-v0.5-${sourceKey}`;
+}
+
+async function deleteDatabase(name: string): Promise<void> {
+  const request = indexedDB.deleteDatabase(name);
+  await new Promise<void>((resolve, reject) => {
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error ?? new Error("IndexedDB deletion failed."));
+    request.onblocked = () => reject(new Error("IndexedDB deletion was blocked by another tab."));
+  });
 }

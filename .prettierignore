@@ -1,1 +1,2 @@
-contracts/test-sessions/v1/*.json
+# Canonical protocol files are byte-for-byte checksum pins.
+contracts/**

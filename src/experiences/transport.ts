@@ -1,15 +1,13 @@
-import type { ExperienceConsentState, Identity } from "../types";
+import type { Identity } from "../types";
 import { TransportError } from "../transport";
 import type {
+  BootstrapFetchResult,
   BootstrapResponse,
   DecisionResponse,
   ExperienceInteraction,
   ExperienceMetadata,
-  ExperienceSettings,
   RuntimeContext,
 } from "./types";
-
-type ActiveConsent = Extract<ExperienceConsentState, "contextual" | "personalized">;
 
 export class ExperienceTransport {
   constructor(
@@ -18,56 +16,52 @@ export class ExperienceTransport {
     private readonly sourceKey: string,
   ) {}
 
-  bootstrap(input: {
-    consent: ActiveConsent;
-    profileConsentGranted: boolean;
+  async bootstrap(input: {
     identity: Identity;
     metadata: ExperienceMetadata;
-    settings: ExperienceSettings;
     testDeviceToken: string;
-  }): Promise<BootstrapResponse> {
-    return this.post("/experiences/v1/bootstrap", {
-      schemaVersion: 1,
-      consent: input.consent,
-      profileConsentGranted: input.profileConsentGranted,
-      actorId: input.identity.anonymousId,
-      sessionId: input.identity.sessionId,
-      metadata: input.metadata,
-      settings: input.settings,
-      testDeviceToken: input.testDeviceToken,
-    });
+    etag?: string;
+  }): Promise<BootstrapFetchResult> {
+    const response = await this.request(
+      "/experiences/v2/bootstrap",
+      {
+        schemaVersion: 2,
+        actorId: input.identity.anonymousId,
+        sessionId: input.identity.sessionId,
+        metadata: input.metadata,
+        testDeviceToken: input.testDeviceToken,
+      },
+      input.etag,
+    );
+    const etag = response.headers.get("etag") ?? undefined;
+    if (response.status === 304) return { notModified: true, ...(etag ? { etag } : {}) };
+    if (!response.ok) throw await TransportError.fromResponse(response);
+    return {
+      notModified: false,
+      response: (await response.json()) as BootstrapResponse,
+      ...(etag ? { etag } : {}),
+    };
   }
 
   decide(input: {
-    consent: ActiveConsent;
-    profileConsentGranted: boolean;
     identity: Identity;
     metadata: ExperienceMetadata;
-    settings: ExperienceSettings;
     testDeviceToken: string;
     candidateVersionIds: string[];
     context: RuntimeContext & { trigger: unknown };
   }): Promise<DecisionResponse> {
-    return this.post("/experiences/v1/decide", {
-      schemaVersion: 1,
-      consent: input.consent,
-      profileConsentGranted: input.profileConsentGranted,
+    return this.post("/experiences/v2/decide", {
+      schemaVersion: 2,
       actorId: input.identity.anonymousId,
       sessionId: input.identity.sessionId,
       metadata: input.metadata,
-      settings: input.settings,
       testDeviceToken: input.testDeviceToken,
       candidateVersionIds: input.candidateVersionIds,
       context: input.context,
     });
   }
 
-  sendInteractions(input: {
-    consent: ActiveConsent;
-    profileConsentGranted: boolean;
-    identity: Identity;
-    interactions: ExperienceInteraction[];
-  }): Promise<{
+  sendInteractions(input: { identity: Identity; interactions: ExperienceInteraction[] }): Promise<{
     accepted: string[];
     duplicates: string[];
     rejected: Array<{
@@ -77,10 +71,8 @@ export class ExperienceTransport {
       retryable: boolean;
     }>;
   }> {
-    return this.post("/experiences/v1/interactions/batch", {
-      schemaVersion: 1,
-      consent: input.consent,
-      profileConsentGranted: input.profileConsentGranted,
+    return this.post("/experiences/v2/interactions/batch", {
+      schemaVersion: 2,
       actorId: input.identity.anonymousId,
       sessionId: input.identity.sessionId,
       interactions: input.interactions,
@@ -88,14 +80,21 @@ export class ExperienceTransport {
   }
 
   private async post<T>(path: string, body: unknown): Promise<T> {
+    const response = await this.request(path, body);
+    if (!response.ok) throw await TransportError.fromResponse(response);
+    return (await response.json()) as T;
+  }
+
+  private async request(path: string, body: unknown, etag?: string): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const response = await fetch(`${this.collectorOrigin}${path}`, {
+      return await fetch(`${this.collectorOrigin}${path}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "X-WTS-Source-Key": this.sourceKey,
+          ...(etag ? { "If-None-Match": etag } : {}),
         },
         body: JSON.stringify(body),
         credentials: "omit",
@@ -103,8 +102,6 @@ export class ExperienceTransport {
         cache: "no-store",
         signal: controller.signal,
       });
-      if (!response.ok) throw await TransportError.fromResponse(response);
-      return (await response.json()) as T;
     } finally {
       clearTimeout(timeout);
     }

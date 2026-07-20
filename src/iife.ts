@@ -11,14 +11,6 @@ if (typeof window !== "undefined") {
       configurable: false,
     });
   }
-  const experiencesIntegrity = currentScript?.dataset?.wtsWebExperiencesIntegrity?.trim();
-  if (experiencesIntegrity) {
-    Object.defineProperty(window, "__wtsWebAssetIntegrity", {
-      value: { experiences: experiencesIntegrity },
-      writable: false,
-      configurable: false,
-    });
-  }
   Object.defineProperty(window, "WtsWeb", { value: api, writable: false, configurable: false });
 }
 

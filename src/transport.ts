@@ -96,7 +96,7 @@ export class HttpTestSessionTransport implements TestSessionTransport {
 
   async pair(sourceKey: string, input: Parameters<TestSessionTransport["pair"]>[1]) {
     return this.json<Awaited<ReturnType<TestSessionTransport["pair"]>>>(
-      "/test/v1/pair",
+      "/sdk/test/v2/pair",
       sourceKey,
       input,
     );
@@ -104,7 +104,7 @@ export class HttpTestSessionTransport implements TestSessionTransport {
 
   async handshake(sourceKey: string, input: Parameters<TestSessionTransport["handshake"]>[1]) {
     return this.json<Awaited<ReturnType<TestSessionTransport["handshake"]>>>(
-      "/test/v1/handshake",
+      "/sdk/test/v2/handshake",
       sourceKey,
       input,
     );
@@ -112,7 +112,7 @@ export class HttpTestSessionTransport implements TestSessionTransport {
 
   async signals(sourceKey: string, input: Parameters<TestSessionTransport["signals"]>[1]) {
     return this.json<Awaited<ReturnType<TestSessionTransport["signals"]>>>(
-      "/test/v1/signals/batch",
+      "/sdk/test/v2/signals/batch",
       sourceKey,
       input,
     );
@@ -120,7 +120,7 @@ export class HttpTestSessionTransport implements TestSessionTransport {
 
   async resolve(sourceKey: string, input: Parameters<TestSessionTransport["resolve"]>[1]) {
     return this.json<Awaited<ReturnType<TestSessionTransport["resolve"]>>>(
-      "/test/v1/resolve",
+      "/sdk/test/v2/resolve",
       sourceKey,
       input,
     );
@@ -131,7 +131,7 @@ export class HttpTestSessionTransport implements TestSessionTransport {
     input: Parameters<TestSessionTransport["decideExperience"]>[1],
   ) {
     return this.json<Awaited<ReturnType<TestSessionTransport["decideExperience"]>>>(
-      "/test/v1/experiences/decide",
+      "/sdk/test/v2/experiences/decide",
       sourceKey,
       input,
     );
@@ -139,7 +139,7 @@ export class HttpTestSessionTransport implements TestSessionTransport {
 
   async leave(sourceKey: string, input: Parameters<TestSessionTransport["leave"]>[1]) {
     return this.json<Awaited<ReturnType<TestSessionTransport["leave"]>>>(
-      "/test/v1/leave",
+      "/sdk/test/v2/leave",
       sourceKey,
       input,
     );
