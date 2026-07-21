@@ -11,8 +11,16 @@
       },
       "type": "identify",
       "externalUserId": "customer_1842",
-      "attributes": { "plan": "enterprise", "country": "TR", "subscribed": true },
-      "metadata": { "platform": "web", "sdkVersion": "0.2.0-alpha.1", "locale": "tr-TR" }
+      "attributes": {
+        "plan": "enterprise",
+        "country": "TR",
+        "subscribed": true
+      },
+      "metadata": {
+        "platform": "web",
+        "sdkVersion": "0.2.0-alpha.1",
+        "locale": "tr-TR"
+      }
     },
     {
       "schemaVersion": 1,
@@ -28,7 +36,11 @@
         "setOnce": { "signup_channel": "partner" },
         "increment": { "lifetime_orders": 1 }
       },
-      "metadata": { "platform": "web", "sdkVersion": "0.2.0-alpha.1", "locale": "tr-TR" }
+      "metadata": {
+        "platform": "web",
+        "sdkVersion": "0.2.0-alpha.1",
+        "locale": "tr-TR"
+      }
     }
   ]
 }

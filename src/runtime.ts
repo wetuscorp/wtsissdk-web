@@ -72,7 +72,17 @@ export function clearBrowserSession(sourceKey: string): void {
 }
 
 function sessionKey(sourceKey: string): string {
-  return `wts-session-${sourceKey}`;
+  return `wts-session-v0.5-${sourceKey}`;
+}
+
+export function clearLegacyBrowserSession(sourceKey: string): void {
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    sessionStorage.removeItem(`wts-session-${sourceKey}`);
+    sessionStorage.removeItem(`wts-test-session-v1-${sourceKey}`);
+  } catch {
+    // Cleanup is best effort when browser storage is restricted.
+  }
 }
 
 function isUuid(value: unknown): value is string {

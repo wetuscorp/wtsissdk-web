@@ -6,9 +6,6 @@ type ExperienceRuntimeFactory = {
 
 type ExperienceWindow = Window & {
   __wtsWebAssetBaseUrl?: string;
-  __wtsWebAssetIntegrity?: {
-    experiences?: string;
-  };
   __wtsWebExperiencesFactory?: ExperienceRuntimeFactory;
   /** Ephemeral identity token passed only to the companion loaded by this module. */
   __wtsWebExperiencesLoadProof?: object;
@@ -17,6 +14,10 @@ type ExperienceWindow = Window & {
 };
 
 const EXPERIENCES_ASSET = "wts-web-experiences.iife.min.js";
+// Replaced after the companion is built. The host supplies SRI only for the
+// primary script; the versioned primary artifact owns this exact companion pin.
+const EMBEDDED_EXPERIENCES_INTEGRITY =
+  "sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 let verifiedFactoryLoader: Promise<ExperienceRuntimeFactory> | undefined;
 
 export async function loadExperienceRuntime(
@@ -36,7 +37,7 @@ function loadFactory(): Promise<ExperienceRuntimeFactory> {
   // A factory already on `window` could have come from an unpinned or a
   // different-version companion. Only this module's SRI-backed load may make
   // a factory trusted.
-  const integrity = host.__wtsWebAssetIntegrity?.experiences;
+  const integrity = EMBEDDED_EXPERIENCES_INTEGRITY;
   if (!isSha384Sri(integrity)) {
     return Promise.reject(new Error("EXPERIENCE_MODULE_UNAVAILABLE"));
   }

@@ -1,1087 +1,580 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generateKeyPairSync, sign } from "node:crypto";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { WtsClientImpl } from "../src/client";
-import { renderExperience } from "../src/experiences/renderer";
+import { verifyExperienceManifestPayload } from "../src/experiences/manifest-verifier";
 import { ExperienceRuntime } from "../src/experiences/runtime";
-import { MemoryStorage } from "../src/storage";
-import type { ExperienceManifest, QueuedExperience } from "../src/experiences/types";
 import type {
-  BatchResponse,
-  Identity,
-  IdentityBatchResponse,
-  IdentityMutation,
-  ExperienceOptions,
-  ExperienceAvailableHandler,
-  Transport,
-  WebEvent,
-} from "../src/types";
+  BootstrapResponse,
+  ExperienceManifest,
+  ManifestCampaign,
+  OnlineKeyset,
+  QueuedExperience,
+} from "../src/experiences/types";
+import { MemoryStorage } from "../src/storage";
+import type { ExperienceContent, StoredExperienceManifest } from "../src/types";
 
-const manifestKeyPair = generateKeyPairSync("ed25519");
-const manifestVerificationKeys = {
-  v1: manifestKeyPair.publicKey.export({ type: "spki", format: "der" }).toString("base64"),
-};
+const sourceKey = "web_source_v2_test";
 
-class AnalyticsTransport implements Transport {
-  async bootstrap(input: { sourceKey: string; identity: Identity; clientEventId: string }) {
-    void input;
-    return { attributionContextId: null, serverTime: new Date().toISOString() };
-  }
+describe("Experiences V2 trust", () => {
+  it("accepts root-signed leaf rotation without changing the embedded root", async () => {
+    const trust = createTrust();
+    const rotated = generateKeyPairSync("ed25519");
+    trust.addLeaf("leaf-2", rotated);
+    const envelope = trust.signManifest(manifest([]), "leaf-2", rotated.privateKey);
 
-  async send(_sourceKey: string, events: WebEvent[]): Promise<BatchResponse> {
-    return {
-      accepted: events.map((event) => event.clientEventId),
-      duplicates: [],
-      rejected: [],
-    };
-  }
-
-  async sendIdentity(
-    _sourceKey: string,
-    mutations: IdentityMutation[],
-  ): Promise<IdentityBatchResponse> {
-    return {
-      accepted: mutations.map((mutation) => mutation.clientMutationId),
-      duplicates: [],
-    };
-  }
-}
-
-describe("Web Experiences", () => {
-  const clients: WtsClientImpl[] = [];
-
-  beforeEach(() => {
-    window.history.replaceState({}, "", "/checkout");
+    await expect(
+      verifyExperienceManifestPayload({
+        signedPayload: envelope.signedPayload,
+        kid: envelope.keyId,
+        signature: envelope.signature,
+        onlineKeyset: envelope.onlineKeyset,
+        expectedSourceKey: sourceKey,
+        rootPublicKey: trust.rootPublicKey,
+      }),
+    ).resolves.toMatchObject({ schemaVersion: 2, sourceKey, manifestVersion: 7 });
   });
+
+  it("fails closed for source replay, unknown leaf, tamper, and expiry", async () => {
+    const trust = createTrust();
+    const valid = trust.signManifest(manifest([]));
+    const verify = (
+      overrides: Partial<Parameters<typeof verifyExperienceManifestPayload>[0]> = {},
+    ) =>
+      verifyExperienceManifestPayload({
+        signedPayload: valid.signedPayload,
+        kid: valid.keyId,
+        signature: valid.signature,
+        onlineKeyset: valid.onlineKeyset,
+        expectedSourceKey: sourceKey,
+        rootPublicKey: trust.rootPublicKey,
+        ...overrides,
+      });
+
+    await expect(verify({ expectedSourceKey: "another_source" })).rejects.toThrow(
+      "EXPERIENCE_MANIFEST_SOURCE_MISMATCH",
+    );
+    await expect(verify({ kid: "unknown" })).rejects.toThrow("EXPERIENCE_MANIFEST_KEY_UNTRUSTED");
+    await expect(verify({ signature: mutate(valid.signature) })).rejects.toThrow(
+      "EXPERIENCE_MANIFEST_SIGNATURE_INVALID",
+    );
+
+    const expired = trust.signManifest(
+      manifest([], {
+        issuedAt: new Date(Date.now() - 20 * 60_000).toISOString(),
+        expiresAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+      }),
+    );
+    await expect(
+      verifyExperienceManifestPayload({
+        signedPayload: expired.signedPayload,
+        kid: expired.keyId,
+        signature: expired.signature,
+        onlineKeyset: expired.onlineKeyset,
+        expectedSourceKey: sourceKey,
+        rootPublicKey: trust.rootPublicKey,
+      }),
+    ).rejects.toThrow("EXPERIENCE_MANIFEST_EXPIRED");
+  });
+});
+
+describe("Experiences V2 runtime", () => {
+  const runtimes: ExperienceRuntime[] = [];
 
   afterEach(() => {
-    for (const client of clients) client.destroy();
-    clients.length = 0;
-    vi.useRealTimers();
+    for (const runtime of runtimes) runtime.destroy();
+    runtimes.length = 0;
+    document.body.replaceChildren();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
-    document.body.replaceChildren();
   });
 
-  it("is disabled by default and does not make an Experiences request", async () => {
-    const fetch = vi.fn();
-    vi.stubGlobal("fetch", fetch);
-    const client = new WtsClientImpl(
-      { sourceKey: sourceKey(), consent: "granted" },
-      new AnalyticsTransport(),
+  it("refreshes a signed manifest and automatically queues at most five campaigns by priority", async () => {
+    const trust = createTrust();
+    const campaigns = Array.from({ length: 6 }, (_, index) =>
+      campaign(`campaign-${index}`, 100 - index),
     );
-    clients.push(client);
+    const bootstrap = trust.signManifest(manifest(campaigns));
+    const requests: Array<Record<string, unknown>> = [];
+    stubExperienceFetch(bootstrap, requests);
+    const runtime = createRuntime(trust.rootPublicKey);
+    runtimes.push(runtime);
 
-    await expect(client.setExperienceConsent("contextual")).resolves.toEqual({
-      accepted: false,
-      reason: "feature_disabled",
+    await runtime.setConsent("granted");
+    runtime.evaluate(pageContext());
+
+    await vi.waitFor(() => expect(runtime.diagnostics().presenting).toBe(true));
+    expect(runtime.diagnostics()).toMatchObject({
+      consent: "granted",
+      decisionMode: "contextual",
+      manifestVersion: 7,
+      queued: 4,
     });
-    await client.page("Checkout");
-
-    expect(fetch).not.toHaveBeenCalled();
+    expect(document.querySelectorAll("[data-wts-experience]")).toHaveLength(1);
+    const bootstrapBody = requests.find((item) => item.path === "/experiences/v2/bootstrap");
+    expect(bootstrapBody).toMatchObject({ schemaVersion: 2 });
+    expect(bootstrapBody).not.toHaveProperty("consent");
+    expect(bootstrapBody).not.toHaveProperty("settings");
+    expect(bootstrapBody).not.toHaveProperty("profileConsentGranted");
   });
 
-  it("does not bootstrap before both analytics and experience consent are granted", async () => {
-    const fetch = vi.fn();
-    vi.stubGlobal("fetch", fetch);
-    const client = new WtsClientImpl(
-      { sourceKey: sourceKey(), experiences: { enabled: true } },
-      new AnalyticsTransport(),
-    );
-    clients.push(client);
-
-    await expect(client.setExperienceConsent("contextual")).resolves.toEqual({
-      accepted: false,
-      reason: "analytics_consent_required",
+  it("records an advanced action as unhandled and leaves the Experience open", async () => {
+    const nativeAttachShadow = Element.prototype.attachShadow;
+    vi.spyOn(Element.prototype, "attachShadow").mockImplementation(function (this: Element, init) {
+      return nativeAttachShadow.call(this, { ...init, mode: "open" });
     });
-    expect(fetch).not.toHaveBeenCalled();
-  });
-
-  it("evaluates a contextual page campaign and exposes it in manual render mode", async () => {
-    const interactions: string[] = [];
-    let bootstrapTestDeviceToken = "";
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        const url = requestUrl(input);
-        if (url.endsWith("/experiences/v1/bootstrap")) {
-          bootstrapTestDeviceToken = (JSON.parse(requestBody(init)) as { testDeviceToken: string })
-            .testDeviceToken;
-          return jsonResponse(bootstrapFixture());
-        }
-        if (url.endsWith("/experiences/v1/interactions/batch")) {
-          const body = JSON.parse(requestBody(init)) as {
-            interactions: Array<{ clientInteractionId: string; type: string }>;
-          };
-          interactions.push(...body.interactions.map((item) => item.type));
-          return jsonResponse({
-            accepted: body.interactions.map((item) => item.clientInteractionId),
-            duplicates: [],
-            rejected: [],
-          });
-        }
-        throw new Error(`Unexpected request: ${url}`);
-      }),
+    const trust = createTrust();
+    const interactions: Array<Record<string, unknown>> = [];
+    stubExperienceFetch(
+      trust.signManifest(
+        manifest([
+          campaign(
+            "advanced-action",
+            10,
+            {
+              primaryAction: {
+                id: "open_settings",
+                label: "Open",
+                type: "OPEN_INTERNAL_ROUTE",
+                target: "/settings",
+              },
+            },
+            {
+              backgroundToken: "brand",
+              textToken: "inverse",
+              accentToken: "secondary",
+            },
+          ),
+        ]),
+      ),
+      [],
+      interactions,
     );
-    const client = new WtsClientImpl(
-      {
-        sourceKey: sourceKey(),
-        consent: "granted",
-        experiences: experienceOptions({
-          renderMode: "manual",
-          allowedInternalRoutes: ["/plans"],
+    const runtime = createRuntime(trust.rootPublicKey);
+    runtime.onAction(() => false);
+    runtimes.push(runtime);
+
+    await runtime.setConsent("granted");
+    runtime.evaluate(pageContext());
+    await vi.waitFor(() => expect(runtime.diagnostics().presenting).toBe(true));
+    const shadow = document.querySelector<HTMLElement>("[data-wts-experience]")?.shadowRoot;
+    const surface = shadow?.querySelector<HTMLElement>('[role="dialog"]');
+    expect(surface).toMatchObject({
+      tabIndex: -1,
+    });
+    expect(surface?.getAttribute("aria-modal")).toBe("true");
+    expect(surface?.getAttribute("aria-labelledby")).toBe(
+      shadow?.querySelector("h2")?.getAttribute("id"),
+    );
+    expect(surface?.getAttribute("aria-describedby")).toBe(
+      shadow?.querySelector("p")?.getAttribute("id"),
+    );
+    expect(shadow?.querySelector('[aria-label="Close"]')).not.toBeNull();
+    const host = document.querySelector<HTMLElement>("[data-wts-experience]");
+    expect(host?.style.getPropertyValue("--wts-experience-background-override")).toBe(
+      "linear-gradient(145deg, #071b34, #0b3260)",
+    );
+    expect(host?.style.getPropertyValue("--wts-experience-text-override")).toBe("#f8fafc");
+    expect(host?.style.getPropertyValue("--wts-experience-accent-override")).toBe("#0b3260");
+    const button = shadow?.querySelector<HTMLButtonElement>("button.primary");
+    button?.click();
+
+    await vi.waitFor(() =>
+      expect(interactions).toContainEqual(
+        expect.objectContaining({
+          type: "primary_action",
+          actionOutcome: "unhandled",
         }),
-      },
-      new AnalyticsTransport(),
+      ),
     );
-    clients.push(client);
-    const available = vi.fn<ExperienceAvailableHandler>();
-    client.onExperienceAvailable(available);
-
-    await client.setExperienceConsent("contextual");
-    await client.page("Checkout");
-    await vi.waitFor(() => expect(available).toHaveBeenCalledTimes(1));
-    await client.flush();
-
-    const initialPresentation = available.mock.calls[0]?.[0];
-    expect(initialPresentation?.experience).toMatchObject({
-      campaignId: "campaign_1",
-      placement: "modal",
-      content: { closeable: true },
-    });
-    expect(typeof initialPresentation?.handle).toBe("string");
-    expect(client.getExperienceDiagnostics()).toMatchObject({
-      enabled: true,
-      consent: "contextual",
-      renderMode: "manual",
-      queued: 1,
-      testDeviceToken: bootstrapTestDeviceToken,
-    });
-    expect(bootstrapTestDeviceToken).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
-    );
-    expect(interactions).toEqual(
-      expect.arrayContaining(["assigned_variant", "eligible", "queued"]),
-    );
+    expect(runtime.diagnostics().presenting).toBe(true);
   });
 
-  it("clears queued Experiences and persistent interactions when denied", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        if (requestUrl(input).endsWith("/experiences/v1/bootstrap")) {
-          return jsonResponse(bootstrapFixture());
-        }
-        const body = JSON.parse(requestBody(init)) as {
-          interactions: Array<{ clientInteractionId: string }>;
-        };
-        return jsonResponse({
-          accepted: body.interactions.map((item) => item.clientInteractionId),
-          duplicates: [],
-          rejected: [],
-        });
-      }),
+  it("cancels an active delayed render when consent is revoked", async () => {
+    const trust = createTrust();
+    stubExperienceFetch(
+      trust.signManifest(manifest([campaign("delayed", 10, {}, { delaySeconds: 30 })])),
+      [],
     );
-    const client = new WtsClientImpl(
-      {
-        sourceKey: sourceKey(),
-        consent: "granted",
-        experiences: experienceOptions({ renderMode: "manual" }),
-      },
-      new AnalyticsTransport(),
-    );
-    clients.push(client);
-    await client.setExperienceConsent("contextual");
-    await client.page("Checkout");
-    await client.setExperienceConsent("denied");
+    const runtime = createRuntime(trust.rootPublicKey);
+    runtimes.push(runtime);
 
-    expect(client.getExperienceDiagnostics()).toMatchObject({
+    await runtime.setConsent("granted");
+    runtime.evaluate(pageContext());
+    await vi.waitFor(() => expect(document.querySelector("[data-wts-experience]")).not.toBeNull());
+    await runtime.setConsent("denied");
+
+    expect(document.querySelector("[data-wts-experience]")).toBeNull();
+    expect(runtime.diagnostics()).toMatchObject({
       consent: "denied",
       queued: 0,
       presenting: false,
     });
   });
 
-  it("offers only the queued manual head, supports idempotent lifecycle reports, and then offers next", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        const url = requestUrl(input);
-        if (url.endsWith("/experiences/v1/bootstrap")) {
-          return jsonResponse(bootstrapFixture({ secondaryCampaign: true }));
-        }
-        if (url.endsWith("/experiences/v1/interactions/batch")) {
-          const body = JSON.parse(requestBody(init)) as {
-            interactions: Array<{ clientInteractionId: string }>;
-          };
-          return jsonResponse({
-            accepted: body.interactions.map((item) => item.clientInteractionId),
-            duplicates: [],
-            rejected: [],
-          });
-        }
-        throw new Error(`Unexpected request: ${url}`);
-      }),
-    );
-    const client = new WtsClientImpl(
-      {
-        sourceKey: sourceKey(),
-        consent: "granted",
-        experiences: experienceOptions({ renderMode: "manual" }),
-      },
-      new AnalyticsTransport(),
-    );
-    clients.push(client);
-    const available = vi.fn<ExperienceAvailableHandler>();
-    client.onExperienceAvailable(available);
-
-    await client.setExperienceConsent("contextual");
-    await client.page("Checkout");
-    expect(available).toHaveBeenCalledTimes(1);
-    const first = available.mock.calls[0]?.[0];
-    expect(first).toMatchObject({
-      experience: { campaignId: "campaign_1" },
-    });
-    expect(typeof first?.handle).toBe("string");
-    expect(first?.experience).not.toHaveProperty("exposureId");
-    expect(first?.experience).not.toHaveProperty("grant");
-    await expect(client.presentNextExperience()).resolves.toBe(false);
-
-    await expect(client.acknowledgeExperienceRender(first!.handle)).resolves.toEqual({
-      accepted: true,
-      idempotent: false,
-    });
-    await expect(client.acknowledgeExperienceRender(first!.handle)).resolves.toEqual({
-      accepted: true,
-      idempotent: true,
-    });
-    await expect(client.acknowledgeExperienceImpression(first!.handle)).resolves.toEqual({
-      accepted: true,
-      idempotent: false,
-    });
-    await expect(client.acknowledgeExperienceImpression(first!.handle)).resolves.toEqual({
-      accepted: true,
-      idempotent: true,
-    });
-    await expect(client.reportExperienceAction(first!.handle, "primary")).resolves.toEqual({
-      accepted: true,
-      idempotent: false,
-    });
-    await expect(client.reportExperienceAction(first!.handle, "primary")).resolves.toEqual({
-      accepted: true,
-      idempotent: true,
-    });
-    await expect(client.dismissExperience(first!.handle)).resolves.toEqual({
-      accepted: true,
-      idempotent: false,
-    });
-    await expect(client.dismissExperience(first!.handle)).resolves.toEqual({
-      accepted: true,
-      idempotent: true,
-    });
-    await new Promise((resolve) => setTimeout(resolve, 3_050));
-    expect(available).toHaveBeenCalledTimes(2);
-    const second = available.mock.calls[1]?.[0];
-    expect(second?.experience).toMatchObject({ campaignId: "campaign_2" });
-    expect(typeof second?.handle).toBe("string");
-  });
-
-  it("offers an already queued manual head when the handler subscribes", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        if (requestUrl(input).endsWith("/experiences/v1/bootstrap")) {
-          return jsonResponse(bootstrapFixture());
-        }
-        const body = JSON.parse(requestBody(init)) as {
-          interactions: Array<{ clientInteractionId: string }>;
-        };
-        return jsonResponse({
-          accepted: body.interactions.map((item) => item.clientInteractionId),
-          duplicates: [],
-          rejected: [],
-        });
-      }),
-    );
-    const client = new WtsClientImpl(
-      {
-        sourceKey: sourceKey(),
-        consent: "granted",
-        experiences: experienceOptions({ renderMode: "manual" }),
-      },
-      new AnalyticsTransport(),
-    );
-    clients.push(client);
-    await client.setExperienceConsent("contextual");
-    await client.page("Checkout");
-
-    const available = vi.fn();
-    client.onExperienceAvailable(available);
-    expect(available).toHaveBeenCalledTimes(1);
-  });
-
-  it("captures asynchronous manual renderer failures without an unhandled rejection", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        if (requestUrl(input).endsWith("/experiences/v1/bootstrap")) {
-          return jsonResponse(bootstrapFixture());
-        }
-        const body = JSON.parse(requestBody(init)) as {
-          interactions: Array<{ clientInteractionId: string }>;
-        };
-        return jsonResponse({
-          accepted: body.interactions.map((item) => item.clientInteractionId),
-          duplicates: [],
-          rejected: [],
-        });
-      }),
-    );
-    const client = new WtsClientImpl(
-      {
-        sourceKey: sourceKey(),
-        consent: "granted",
-        experiences: experienceOptions({ renderMode: "manual" }),
-      },
-      new AnalyticsTransport(),
-    );
-    clients.push(client);
-    client.onExperienceAvailable(async () => {
-      throw new Error("The host renderer failed.");
-    });
-
-    await client.setExperienceConsent("contextual");
-    await client.page("Checkout");
-
-    await vi.waitFor(() => {
-      expect(client.getExperienceDiagnostics().lastErrorCode).toBe(
-        "EXPERIENCE_MANUAL_HANDLER_FAILED",
-      );
-    });
-  });
-
-  it("fails closed when a manifest signature cannot be verified", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request) => {
-        if (!requestUrl(input).endsWith("/experiences/v1/bootstrap")) {
-          throw new Error("Interactions must not be sent for an untrusted manifest.");
-        }
-        return jsonResponse({ ...bootstrapFixture(), signature: "invalid" });
-      }),
-    );
-    const client = new WtsClientImpl(
-      {
-        sourceKey: sourceKey(),
-        consent: "granted",
-        experiences: experienceOptions({ renderMode: "manual" }),
-      },
-      new AnalyticsTransport(),
-    );
-    clients.push(client);
-    const available = vi.fn();
-    client.onExperienceAvailable(available);
-
-    await expect(client.setExperienceConsent("contextual")).resolves.toEqual({ accepted: true });
-    await client.page("Checkout");
-    expect(available).not.toHaveBeenCalled();
-    expect(client.getExperienceDiagnostics().lastErrorCode).toBe(
-      "EXPERIENCE_MANIFEST_SIGNATURE_INVALID",
-    );
-  });
-
-  it("fails closed when bootstrap names an unpinned manifest key", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request) => {
-        if (!requestUrl(input).endsWith("/experiences/v1/bootstrap")) {
-          throw new Error("Interactions must not be sent for an untrusted manifest.");
-        }
-        return jsonResponse({ ...bootstrapFixture(), keyId: "rotated_key" });
-      }),
-    );
-    const client = new WtsClientImpl(
-      {
-        sourceKey: sourceKey(),
-        consent: "granted",
-        experiences: experienceOptions({ renderMode: "manual" }),
-      },
-      new AnalyticsTransport(),
-    );
-    clients.push(client);
-
-    await client.setExperienceConsent("contextual");
-    await client.page("Checkout");
-    expect(client.getExperienceDiagnostics().lastErrorCode).toBe(
-      "EXPERIENCE_MANIFEST_KEY_UNTRUSTED",
-    );
-  });
-
-  it("fails closed when a validly signed manifest belongs to a different source", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request) => {
-        if (!requestUrl(input).endsWith("/experiences/v1/bootstrap")) {
-          throw new Error("Interactions must not be sent for a cross-source manifest.");
-        }
-        return jsonResponse(bootstrapFixture({ sourceKey: "web_other_source_123456" }));
-      }),
-    );
-    const client = new WtsClientImpl(
-      {
-        sourceKey: sourceKey(),
-        consent: "granted",
-        experiences: experienceOptions({ renderMode: "manual" }),
-      },
-      new AnalyticsTransport(),
-    );
-    clients.push(client);
-    const available = vi.fn();
-    client.onExperienceAvailable(available);
-
-    await client.setExperienceConsent("contextual");
-    await client.page("Checkout");
-
-    expect(available).not.toHaveBeenCalled();
-    expect(client.getExperienceDiagnostics().lastErrorCode).toBe(
-      "EXPERIENCE_MANIFEST_SOURCE_MISMATCH",
-    );
-  });
-
-  it("requires an explicit profile-consent signal for personalized Experiences", async () => {
-    const profileConsentSignals: boolean[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        if (requestUrl(input).endsWith("/experiences/v1/bootstrap")) {
-          profileConsentSignals.push(
-            (JSON.parse(requestBody(init)) as { profileConsentGranted: boolean })
-              .profileConsentGranted,
-          );
-          return jsonResponse(bootstrapFixture());
-        }
-        const body = JSON.parse(requestBody(init)) as {
-          interactions: Array<{ clientInteractionId: string }>;
-        };
-        return jsonResponse({
-          accepted: body.interactions.map((item) => item.clientInteractionId),
-          duplicates: [],
-          rejected: [],
-        });
-      }),
-    );
-    const client = new WtsClientImpl(
-      {
-        sourceKey: sourceKey(),
-        consent: "granted",
-        experiences: experienceOptions({ renderMode: "manual" }),
-      },
-      new AnalyticsTransport(),
-    );
-    clients.push(client);
-    await client.page("Checkout");
-    await expect(client.setExperienceConsent("personalized")).resolves.toEqual({
-      accepted: false,
-      reason: "profile_consent_required",
-    });
-
-    await client.setProfileConsent(true);
-    await expect(client.setExperienceConsent("personalized")).resolves.toEqual({
-      accepted: false,
-      reason: "profile_identity_required",
-    });
-    await client.identify("customer_1842");
-    await client.flush();
-    await expect(client.setExperienceConsent("personalized")).resolves.toEqual({ accepted: true });
-    expect(profileConsentSignals).toEqual([true]);
-
-    await client.setProfileConsent(false);
-    expect(client.getExperienceDiagnostics().consent).toBe("pending");
-  });
-
-  it("requires a collector-accepted identity binding before personalized evaluation", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        if (requestUrl(input).endsWith("/experiences/v1/bootstrap")) {
-          return jsonResponse(bootstrapFixture());
-        }
-        if (requestUrl(input).endsWith("/experiences/v1/decide")) {
-          return jsonResponse({ decisions: [], serverTime: new Date().toISOString() });
-        }
-        const body = JSON.parse(requestBody(init)) as {
-          interactions: Array<{ clientInteractionId: string }>;
-        };
-        return jsonResponse({
-          accepted: body.interactions.map((item) => item.clientInteractionId),
-          duplicates: [],
-          rejected: [],
-        });
-      }),
-    );
-    const client = new WtsClientImpl(
-      {
-        sourceKey: sourceKey(),
-        consent: "granted",
-        experiences: experienceOptions({ renderMode: "manual" }),
-      },
-      new AnalyticsTransport(),
-    );
-    clients.push(client);
-
-    await client.setProfileConsent(true);
-    await expect(client.setExperienceConsent("personalized")).resolves.toEqual({
-      accepted: false,
-      reason: "profile_identity_required",
-    });
-    await client.identify("customer_1842");
-    await client.flush();
-    await expect(client.setExperienceConsent("personalized")).resolves.toEqual({ accepted: true });
-    await client.page("Checkout");
-  });
-
-  it("consumes the two-overlay session cap at presentation, not at impression", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        const url = requestUrl(input);
-        if (url.endsWith("/experiences/v1/bootstrap")) {
-          return jsonResponse(bootstrapFixture({ campaignCount: 3 }));
-        }
-        const body = JSON.parse(requestBody(init)) as {
-          interactions: Array<{ clientInteractionId: string }>;
-        };
-        return jsonResponse({
-          accepted: body.interactions.map((item) => item.clientInteractionId),
-          duplicates: [],
-          rejected: [],
-        });
-      }),
-    );
-    const client = new WtsClientImpl(
-      {
-        sourceKey: sourceKey(),
-        consent: "granted",
-        experiences: experienceOptions({ renderMode: "manual" }),
-      },
-      new AnalyticsTransport(),
-    );
-    clients.push(client);
-    const available = vi.fn<ExperienceAvailableHandler>();
-    client.onExperienceAvailable(available);
-
-    await client.setExperienceConsent("contextual");
-    await client.page("Checkout");
-    expect(available).toHaveBeenCalledTimes(1);
-
-    const first = available.mock.calls[0]![0];
-    await expect(client.acknowledgeExperienceRender(first.handle)).resolves.toMatchObject({
-      accepted: true,
-    });
-    // No impression is reported; this still counts as a presented overlay.
-    await expect(client.dismissExperience(first.handle)).resolves.toMatchObject({ accepted: true });
-    await vi.waitFor(() => expect(available).toHaveBeenCalledTimes(2), { timeout: 4_000 });
-
-    const second = available.mock.calls[1]![0];
-    await expect(client.acknowledgeExperienceRender(second.handle)).resolves.toMatchObject({
-      accepted: true,
-    });
-    await expect(client.dismissExperience(second.handle)).resolves.toMatchObject({
-      accepted: true,
-    });
-    await new Promise((resolve) => setTimeout(resolve, 3_100));
-
-    expect(available).toHaveBeenCalledTimes(2);
-    expect(client.getExperienceDiagnostics().queued).toBe(0);
-  }, 10_000);
-
-  it("rejects executable URL schemes even if a bypassed configuration tries to allow one", () => {
-    const runtime = new ExperienceRuntime({
-      sourceKey: sourceKey(),
-      collectorOrigin: "https://collect.wts.is",
-      timeoutMs: 2_000,
-      debug: false,
-      options: {
-        enabled: true,
-        renderMode: "manual",
-        manifestVerificationKeys,
-        allowedInternalRoutes: [],
-        allowedCallbackKeys: [],
-        allowedDeepLinkHosts: [],
-        // Deliberately bypasses validateOptions: runtime policy must still
-        // reject script and local-resource schemes from a malicious manifest.
-        allowedDeepLinkSchemes: ["javascript", "data", "file"],
-        allowedWebOrigins: [],
-      },
-      getAnalyticsConsent: () => "granted",
-      getProfileConsent: () => true,
-      getProfileIdentityReady: () => true,
-      getIdentity: () => ({ anonymousId: "anonymous", sessionId: "session" }),
-      getStorage: () => undefined,
-      flushIdentity: async () => undefined,
-    });
-    const actionAllowed = (
-      runtime as unknown as {
-        isActionAllowed(action: { type: "OPEN_DEEP_LINK"; target: string }): boolean;
-      }
-    ).isActionAllowed.bind(runtime);
-
-    expect(actionAllowed({ type: "OPEN_DEEP_LINK", target: "javascript:alert(1)" })).toBe(false);
-    expect(actionAllowed({ type: "OPEN_DEEP_LINK", target: "data:text/html,unsafe" })).toBe(false);
-    expect(actionAllowed({ type: "OPEN_DEEP_LINK", target: "file:///etc/passwd" })).toBe(false);
-    runtime.destroy();
-  });
-
-  it("drops queued Experiences after their verified manifest expires", async () => {
-    const storage = new MemoryStorage();
-    const runtime = new ExperienceRuntime({
-      sourceKey: sourceKey(),
-      collectorOrigin: "https://collect.wts.is",
-      timeoutMs: 2_000,
-      debug: false,
-      options: {
-        enabled: true,
-        renderMode: "automatic",
-        manifestVerificationKeys,
-        allowedInternalRoutes: [],
-        allowedCallbackKeys: [],
-        allowedDeepLinkHosts: [],
-        allowedDeepLinkSchemes: [],
-        allowedWebOrigins: [],
-      },
-      getAnalyticsConsent: () => "granted",
-      getProfileConsent: () => false,
-      getProfileIdentityReady: () => false,
-      getIdentity: () => ({ anonymousId: "anonymous", sessionId: "session" }),
-      getStorage: () => storage,
-      flushIdentity: async () => undefined,
-    });
+  it("drops an already queued candidate after its signed manifest expires", async () => {
+    const trust = createTrust();
+    const runtime = createRuntime(trust.rootPublicKey);
+    runtimes.push(runtime);
     const internals = runtime as unknown as {
-      consent: "contextual";
+      consent: "granted";
       queue: QueuedExperience[];
     };
-    internals.consent = "contextual";
-    internals.queue = [
-      {
-        ...availableExperienceFixture(),
-        manifestExpiresAt: Date.now() - 1,
-      },
-    ];
+    internals.consent = "granted";
+    internals.queue = [queuedExperience({ manifestExpiresAt: Date.now() - 1 })];
 
     await expect(runtime.presentNext()).resolves.toBe(false);
     expect(runtime.diagnostics().queued).toBe(0);
-    runtime.destroy();
   });
 
-  it("clears queued Experience interactions when the anonymous identity resets", async () => {
+  it("clears queued interactions when identity changes", async () => {
     const storage = new MemoryStorage();
     await storage.enqueueExperience({
-      clientInteractionId: "interaction_1",
-      grant: "v1.payload.signature",
-      campaignId: "campaign_1",
-      campaignVersionId: "version_1",
-      assignmentId: "assignment_1",
-      variantId: "variant_1",
-      exposureId: "exposure_1",
+      clientInteractionId: "00000000-0000-4000-8000-000000000010",
+      grant: "leaf-1.payload.signature",
+      campaignId: "campaign-1",
+      campaignVersionId: "campaign-1-v1",
+      assignmentId: "assignment-1",
+      variantId: "variant-1",
+      exposureId: "exposure-1",
       type: "eligible",
       actionId: null,
+      actionOutcome: null,
       triggerEventId: null,
       occurredAt: new Date().toISOString(),
-      metadata: { platform: "web", sdkVersion: "test", locale: "en" },
+      metadata: { platform: "web", sdkVersion: "0.5.0-alpha.1", locale: "en" },
       failureCode: null,
     });
     const runtime = new ExperienceRuntime({
-      sourceKey: sourceKey(),
-      collectorOrigin: "https://collect.wts.is",
-      timeoutMs: 2_000,
+      sourceKey,
+      collectorOrigin: "https://collect.example.test",
+      timeoutMs: 500,
       debug: false,
-      options: {
-        enabled: false,
-        renderMode: "manual",
-        manifestVerificationKeys,
-        allowedInternalRoutes: [],
-        allowedCallbackKeys: [],
-        allowedDeepLinkHosts: [],
-        allowedDeepLinkSchemes: [],
-        allowedWebOrigins: [],
-      },
-      getAnalyticsConsent: () => "granted",
-      getProfileConsent: () => false,
-      getProfileIdentityReady: () => false,
-      getIdentity: () => ({ anonymousId: "anonymous", sessionId: "session" }),
+      getConsent: () => "granted",
+      getIdentity: () => ({
+        anonymousId: "00000000-0000-4000-8000-000000000001",
+        sessionId: "00000000-0000-4000-8000-000000000002",
+      }),
       getStorage: () => storage,
-      flushIdentity: async () => undefined,
     });
+    runtimes.push(runtime);
 
     await runtime.identityChanged();
+
     expect((await storage.load()).experienceQueue).toEqual([]);
-    runtime.destroy();
   });
 
-  it("requires a host handler to accept a custom callback before recording or closing", async () => {
-    const dismiss = vi.fn();
-    const candidate = availableExperienceFixture();
-    candidate.content.translations.en!.primaryAction = {
-      id: "apply_offer",
-      label: "Apply offer",
-      type: "CUSTOM_CALLBACK",
-      target: "apply_offer",
-    };
-    const runtime = new ExperienceRuntime({
-      sourceKey: sourceKey(),
-      collectorOrigin: "https://collect.wts.is",
-      timeoutMs: 2_000,
-      debug: false,
-      options: {
-        enabled: true,
-        renderMode: "automatic",
-        manifestVerificationKeys,
-        allowedInternalRoutes: [],
-        allowedCallbackKeys: ["apply_offer"],
-        allowedDeepLinkHosts: [],
-        allowedDeepLinkSchemes: [],
-        allowedWebOrigins: [],
-      },
-      getAnalyticsConsent: () => "granted",
-      getProfileConsent: () => false,
-      getProfileIdentityReady: () => false,
-      getIdentity: () => ({ anonymousId: "anonymous", sessionId: "session" }),
-      getStorage: () => undefined,
-      flushIdentity: async () => undefined,
+  it("rejects unsafe action schemes and keeps the Experience open", async () => {
+    const nativeAttachShadow = Element.prototype.attachShadow;
+    vi.spyOn(Element.prototype, "attachShadow").mockImplementation(function (this: Element, init) {
+      return nativeAttachShadow.call(this, { ...init, mode: "open" });
     });
-    const internals = runtime as unknown as {
-      current: QueuedExperience;
-      renderHandle: { dismiss(reason: "dismissed"): void };
-      handleAction(
-        experience: QueuedExperience,
-        action: NonNullable<QueuedExperience["content"]["translations"]["en"]["primaryAction"]>,
-      ): Promise<void>;
-    };
-    internals.current = candidate;
-    internals.renderHandle = { dismiss };
-    const translation = candidate.content.translations.en;
-    if (translation === undefined || translation.primaryAction === undefined) {
-      throw new Error("Expected fixture to provide a custom callback action");
-    }
-    const action = translation.primaryAction;
+    const trust = createTrust();
+    const interactions: Array<Record<string, unknown>> = [];
+    stubExperienceFetch(
+      trust.signManifest(
+        manifest([
+          campaign("unsafe-action", 10, {
+            primaryAction: {
+              id: "unsafe",
+              label: "Unsafe",
+              type: "OPEN_DEEP_LINK",
+              target: "javascript:alert(1)",
+            },
+          }),
+        ]),
+      ),
+      [],
+      interactions,
+    );
+    const runtime = createRuntime(trust.rootPublicKey);
+    runtimes.push(runtime);
 
-    await internals.handleAction(candidate, action);
-    expect(dismiss).not.toHaveBeenCalled();
-    expect(runtime.diagnostics().lastErrorCode).toBe("EXPERIENCE_CALLBACK_UNHANDLED");
+    await runtime.setConsent("granted");
+    runtime.evaluate(pageContext());
+    await vi.waitFor(() => expect(runtime.diagnostics().presenting).toBe(true));
+    const shadow = document.querySelector<HTMLElement>("[data-wts-experience]")?.shadowRoot;
+    shadow?.querySelector<HTMLButtonElement>("button.primary")?.click();
 
-    runtime.onAction(() => true);
-    await internals.handleAction(candidate, action);
-    expect(dismiss).toHaveBeenCalledWith("dismissed");
-    runtime.destroy();
+    await vi.waitFor(() =>
+      expect(interactions).toContainEqual(
+        expect.objectContaining({ actionId: "unsafe", actionOutcome: "unhandled" }),
+      ),
+    );
+    expect(runtime.diagnostics()).toMatchObject({
+      presenting: true,
+      lastErrorCode: "EXPERIENCE_ACTION_NOT_ALLOWED",
+    });
   });
 
-  it("never invokes manual callbacks in automatic mode and aborts a delayed render on consent denial", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        const url = requestUrl(input);
-        if (url.endsWith("/experiences/v1/bootstrap")) {
-          return jsonResponse(bootstrapFixture({ delaySeconds: 10 }));
-        }
-        if (url.endsWith("/experiences/v1/interactions/batch")) {
-          const body = JSON.parse(requestBody(init)) as {
-            interactions: Array<{ clientInteractionId: string }>;
-          };
-          return jsonResponse({
-            accepted: body.interactions.map((item) => item.clientInteractionId),
-            duplicates: [],
-            rejected: [],
-          });
-        }
-        throw new Error(`Unexpected request: ${url}`);
+  it("never renders an expired cached manifest while offline", async () => {
+    const trust = createTrust();
+    const expired = trust.signManifest(
+      manifest([campaign("expired", 1)], {
+        issuedAt: new Date(Date.now() - 20 * 60_000).toISOString(),
+        expiresAt: new Date(Date.now() - 10 * 60_000).toISOString(),
       }),
     );
-    const client = new WtsClientImpl(
-      {
-        sourceKey: sourceKey(),
-        consent: "granted",
-        experiences: experienceOptions({ renderMode: "automatic" }),
-      },
-      new AnalyticsTransport(),
-    );
-    clients.push(client);
-    const available = vi.fn();
-    client.onExperienceAvailable(available);
-
-    await client.setExperienceConsent("contextual");
-    await client.page("Checkout");
-    await vi.waitFor(() => expect(document.querySelector("[data-wts-experience]")).not.toBeNull());
-    expect(available).not.toHaveBeenCalled();
-
-    await client.setExperienceConsent("denied");
-    expect(document.querySelector("[data-wts-experience]")).toBeNull();
-    expect(client.getExperienceDiagnostics().presenting).toBe(false);
-  });
-
-  it("renders an accessible isolated surface and verifies impressions after one second", async () => {
-    vi.useFakeTimers();
-    const originalAttachShadow = Element.prototype.attachShadow;
-    vi.spyOn(Element.prototype, "attachShadow").mockImplementation(function (this: Element) {
-      return originalAttachShadow.call(this, { mode: "open" });
-    });
+    const storage = new MemoryStorage();
+    await storage.saveExperienceManifest(toStored(expired));
     vi.stubGlobal(
-      "IntersectionObserver",
-      class implements IntersectionObserver {
-        readonly root = null;
-        readonly rootMargin = "";
-        readonly scrollMargin = "";
-        readonly thresholds = [0, 0.5, 1];
-
-        constructor(private readonly callback: IntersectionObserverCallback) {}
-
-        observe(target: Element) {
-          this.callback([{ intersectionRatio: 0.5, target } as IntersectionObserverEntry], this);
-        }
-
-        disconnect() {}
-        unobserve() {}
-        takeRecords() {
-          return [];
-        }
-      },
+      "fetch",
+      vi.fn(async () => Promise.reject(new TypeError("offline"))),
     );
-    const previousFocus = document.createElement("button");
-    previousFocus.textContent = "Checkout";
-    document.body.append(previousFocus);
-    previousFocus.focus();
-    const onAction = vi.fn();
-    const onDismiss = vi.fn();
-    const onImpression = vi.fn();
-
-    await renderExperience(availableExperienceFixture(), {
-      locale: "en-US",
-      onAction,
-      onDismiss,
-      onImpression,
+    let consent: "pending" | "granted" | "denied" = "granted";
+    const runtime = new ExperienceRuntime({
+      sourceKey,
+      collectorOrigin: "https://collect.example.test",
+      timeoutMs: 500,
+      debug: false,
+      getConsent: () => consent,
+      getIdentity: () => ({
+        anonymousId: "00000000-0000-4000-8000-000000000001",
+        sessionId: "00000000-0000-4000-8000-000000000002",
+      }),
+      getStorage: () => storage,
+      rootPublicKey: trust.rootPublicKey,
     });
+    runtimes.push(runtime);
 
-    const host = document.querySelector<HTMLElement>("[data-wts-experience='exposure_1']");
-    const root = host?.shadowRoot;
-    const surface = root?.querySelector<HTMLElement>("[role='dialog']");
-    expect(host).toBeTruthy();
-    expect(root?.querySelector("style")?.textContent).toContain("prefers-reduced-motion");
-    expect(surface).toMatchObject({ tabIndex: -1 });
-    expect(surface?.getAttribute("aria-modal")).toBe("true");
-    expect(root?.querySelector("h2")?.textContent).toBe("Complete your order");
-    expect(root?.querySelector("p")?.textContent).toBe("Your cart is ready.");
-    expect(host?.style.getPropertyValue("--wts-experience-background-override")).toBe(
-      "linear-gradient(145deg, #071b34, #0b3260)",
-    );
-    expect(host?.style.getPropertyValue("--wts-experience-text-override")).toBe("#f8fafc");
-    expect(host?.style.getPropertyValue("--wts-experience-accent-override")).toBe("#0b3260");
+    await runtime.setConsent("granted");
+    runtime.evaluate(pageContext());
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
-    await vi.advanceTimersByTimeAsync(999);
-    expect(onImpression).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
-    expect(onImpression).toHaveBeenCalledTimes(1);
-
-    root?.querySelector<HTMLButtonElement>(".primary")?.click();
-    expect(onAction).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "primary", type: "OPEN_INTERNAL_ROUTE" }),
-    );
-
-    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-    expect(onDismiss).toHaveBeenCalledWith("dismissed");
-    expect(document.querySelector("[data-wts-experience='exposure_1']")).toBeNull();
-    expect(document.activeElement).toBe(previousFocus);
-  });
-
-  it("removes a delayed renderer surface when its lifecycle signal is aborted", async () => {
-    vi.useFakeTimers();
-    const controller = new AbortController();
-    const onDismiss = vi.fn();
-    const pending = renderExperience(availableExperienceFixture({ delaySeconds: 5 }), {
-      locale: "en",
-      signal: controller.signal,
-      onAction: vi.fn(),
-      onDismiss,
-      onImpression: vi.fn(),
-    });
-    expect(document.querySelector("[data-wts-experience='exposure_1']")).not.toBeNull();
-
-    controller.abort();
-    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
-    expect(document.querySelector("[data-wts-experience='exposure_1']")).toBeNull();
-    expect(onDismiss).not.toHaveBeenCalled();
+    expect(runtime.diagnostics().presenting).toBe(false);
+    expect(document.querySelector("[data-wts-experience]")).toBeNull();
+    consent = "denied";
   });
 });
 
-function bootstrapFixture(
-  options: {
-    delaySeconds?: number;
-    rawManifest?: unknown;
-    secondaryCampaign?: boolean;
-    campaignCount?: number;
-    sourceKey?: string;
-  } = {},
-) {
-  const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
-  const manifest: ExperienceManifest = {
-    schemaVersion: 1,
-    sourceId: "source_1",
-    sourceKey: options.sourceKey ?? sourceKey(),
-    sourceManifestVersion: 7,
-    generatedAt: new Date().toISOString(),
-    expiresAt,
-    campaigns: [
-      {
-        campaignId: "campaign_1",
-        campaignVersionId: "version_1",
-        priority: 10,
-        startsAt: null,
-        endsAt: null,
-        placement: "modal",
-        defaultLocale: "en",
-        trigger: {
-          type: "page_view",
-          match: { kind: "pathname_exact", value: "/checkout" },
-        },
-        targeting: {
-          kind: "condition",
-          field: "platform",
-          operator: "equals",
-          value: "web",
-        },
-        frequency: { session: 1, daily: 1 },
-        variants: [
-          {
-            id: "variant_1",
-            key: "control",
-            content: {
-              translations: {
-                en: {
-                  title: "Complete your order",
-                  description: "Your cart is ready.",
-                  primaryAction: {
-                    id: "primary",
-                    label: "Continue",
-                    type: "OPEN_INTERNAL_ROUTE",
-                    target: "/plans",
-                  },
-                },
-              },
-              closeable: true,
-              themePreset: "brand",
-              delaySeconds: options.delaySeconds ?? 0,
-              autoCloseSeconds: null,
-            },
-            asset: null,
-          },
-        ],
-        requiresPersonalization: false,
-        grant: "v1.payload.signature",
-        assignment: {
-          assignmentId: "assignment_1",
-          kind: "variant",
-          variantId: "variant_1",
-        },
-      },
-    ],
+function createRuntime(rootPublicKey: string): ExperienceRuntime {
+  const storage = new MemoryStorage();
+  return new ExperienceRuntime({
+    sourceKey,
+    collectorOrigin: "https://collect.example.test",
+    timeoutMs: 500,
+    debug: false,
+    getConsent: () => "granted",
+    getIdentity: () => ({
+      anonymousId: "00000000-0000-4000-8000-000000000001",
+      sessionId: "00000000-0000-4000-8000-000000000002",
+    }),
+    getStorage: () => storage,
+    rootPublicKey,
+  });
+}
+
+function stubExperienceFetch(
+  bootstrap: BootstrapResponse,
+  requests: Array<Record<string, unknown>>,
+  interactions: Array<Record<string, unknown>> = [],
+): void {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const requestUrl =
+        typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const path = new URL(requestUrl).pathname;
+      const rawBody = typeof init?.body === "string" ? init.body : "{}";
+      const body = JSON.parse(rawBody) as Record<string, unknown>;
+      requests.push({ path, ...body });
+      if (path === "/experiences/v2/bootstrap") {
+        return jsonResponse(bootstrap, { etag: '"manifest-7"' });
+      }
+      if (path === "/experiences/v2/decide") {
+        return jsonResponse({
+          mode: "contextual",
+          decisions: [],
+          serverTime: new Date().toISOString(),
+        });
+      }
+      if (path === "/experiences/v2/interactions/batch") {
+        const items = body.interactions as Array<Record<string, unknown>>;
+        interactions.push(...items);
+        return jsonResponse({
+          accepted: items.map((item) => item.clientInteractionId),
+          duplicates: [],
+          rejected: [],
+        });
+      }
+      throw new Error(`Unexpected request ${path}`);
+    }),
+  );
+}
+
+function createTrust() {
+  const root = generateKeyPairSync("ed25519");
+  const leaves = new Map<string, ReturnType<typeof generateKeyPairSync>>();
+  leaves.set("leaf-1", generateKeyPairSync("ed25519"));
+  const api = {
+    rootPublicKey: root.publicKey.export({ type: "spki", format: "der" }).toString("base64"),
+    addLeaf(keyId: string, pair: ReturnType<typeof generateKeyPairSync>) {
+      leaves.set(keyId, pair);
+    },
+    signManifest(
+      value: ExperienceManifest,
+      keyId = "leaf-1",
+      privateKey = leaves.get(keyId)!.privateKey,
+    ): BootstrapResponse {
+      const now = Date.now();
+      const keysetPayload = {
+        version: 1,
+        issuedAt: new Date(now - 60_000).toISOString(),
+        expiresAt: new Date(now + 24 * 60 * 60_000).toISOString(),
+        keys: [...leaves.entries()].map(([id, pair]) => ({
+          keyId: id,
+          algorithm: "Ed25519" as const,
+          publicKey: pair.publicKey.export({ type: "spki", format: "der" }).toString("base64"),
+          notBefore: new Date(now - 60_000).toISOString(),
+          expiresAt: new Date(now + 24 * 60 * 60_000).toISOString(),
+        })),
+      };
+      const keysetBytes = Buffer.from(canonicalJson(keysetPayload));
+      const onlineKeyset: OnlineKeyset = {
+        ...keysetPayload,
+        signedPayload: keysetBytes.toString("base64url"),
+        rootSignature: sign(null, keysetBytes, root.privateKey).toString("base64url"),
+      };
+      const manifestBytes = Buffer.from(canonicalJson(value));
+      return {
+        onlineKeyset,
+        manifest: value,
+        signedPayload: manifestBytes.toString("base64url"),
+        signature: sign(null, manifestBytes, privateKey).toString("base64url"),
+        keyId,
+        expiresAt: value.expiresAt,
+      };
+    },
   };
-  const extraCampaigns = options.campaignCount
-    ? Math.max(0, options.campaignCount - 1)
-    : options.secondaryCampaign
-      ? 1
-      : 0;
-  for (let index = 0; index < extraCampaigns; index += 1) {
-    const first = manifest.campaigns[0]!;
-    manifest.campaigns.push({
-      ...structuredClone(first),
-      campaignId: `campaign_${index + 2}`,
-      campaignVersionId: `version_${index + 2}`,
-      priority: 5 - index,
-      assignment: {
-        assignmentId: `assignment_${index + 2}`,
-        kind: "variant",
-        variantId: "variant_1",
-      },
-    });
-  }
-  const signedPayload = Buffer.from(JSON.stringify(manifest)).toString("base64url");
+  return api;
+}
+
+function manifest(
+  campaigns: ManifestCampaign[],
+  times: { issuedAt?: string; expiresAt?: string } = {},
+): ExperienceManifest {
+  const now = Date.now();
   return {
-    // The raw manifest is intentionally ignored by the runtime. This keeps the
-    // fixture honest about the verified payload boundary.
-    manifest: options.rawManifest ?? { schemaVersion: 999 },
-    signedPayload,
-    signature: sign(
-      null,
-      Buffer.from(signedPayload, "base64url"),
-      manifestKeyPair.privateKey,
-    ).toString("base64url"),
-    keyId: "v1",
-    expiresAt,
+    schemaVersion: 2,
+    sourceId: "source-v2",
+    sourceKey,
+    manifestVersion: 7,
+    environment: "production",
+    generatedAt: new Date(now).toISOString(),
+    issuedAt: times.issuedAt ?? new Date(now - 1_000).toISOString(),
+    expiresAt: times.expiresAt ?? new Date(now + 10 * 60_000).toISOString(),
+    campaigns,
   };
 }
 
-function experienceOptions(overrides: Partial<ExperienceOptions> = {}): ExperienceOptions {
+function campaign(
+  id: string,
+  priority: number,
+  actions: Partial<ExperienceContent["translations"][string]> = {},
+  contentOverrides: Partial<ExperienceContent> = {},
+): ManifestCampaign {
   return {
-    enabled: true,
-    manifestVerificationKeys,
+    campaignId: id,
+    campaignVersionId: `${id}-v1`,
+    priority,
+    startsAt: null,
+    endsAt: null,
+    placement: "modal",
+    defaultLocale: "en",
+    trigger: { type: "page_view", match: { kind: "pathname_exact", value: "/checkout" } },
+    targeting: { kind: "all", conditions: [] },
+    frequency: { session: 1, daily: 1 },
+    variants: [
+      {
+        id: `${id}-variant`,
+        key: "control",
+        content: {
+          translations: {
+            en: { title: id, description: "Experience V2", ...actions },
+          },
+          closeable: true,
+          themePreset: "light",
+          delaySeconds: 0,
+          autoCloseSeconds: null,
+          ...contentOverrides,
+        },
+        asset: null,
+      },
+    ],
+    requiresPersonalization: false,
+    grant: `leaf-1.${"a".repeat(64)}.${"b".repeat(64)}`,
+    assignment: {
+      assignmentId: `${id}-assignment`,
+      kind: "variant",
+      variantId: `${id}-variant`,
+    },
+  };
+}
+
+function queuedExperience(overrides: Partial<QueuedExperience> = {}): QueuedExperience {
+  const source = campaign("queued", 1);
+  const variant = source.variants[0]!;
+  return {
+    campaignId: source.campaignId,
+    campaignVersionId: source.campaignVersionId,
+    assignmentId: source.assignment!.assignmentId,
+    variantId: variant.id,
+    exposureId: "00000000-0000-4000-8000-000000000020",
+    placement: source.placement,
+    priority: source.priority,
+    content: variant.content,
+    grant: source.grant!,
+    defaultLocale: source.defaultLocale,
+    eligibleAt: Date.now(),
+    manifestExpiresAt: Date.now() + 60_000,
+    frequency: source.frequency,
     ...overrides,
   };
 }
 
-function jsonResponse(value: unknown) {
+function pageContext() {
+  return {
+    trigger: {
+      type: "page_view" as const,
+      match: { kind: "pathname_exact" as const, value: "/checkout" },
+    },
+    pathname: "/checkout",
+    properties: {},
+    triggerEventId: "00000000-0000-4000-8000-000000000003",
+  };
+}
+
+function toStored(value: BootstrapResponse): StoredExperienceManifest {
+  return {
+    signedPayload: value.signedPayload,
+    signature: value.signature,
+    keyId: value.keyId,
+    expiresAt: value.expiresAt,
+    onlineKeyset: value.onlineKeyset,
+    cachedAt: new Date().toISOString(),
+  };
+}
+
+function jsonResponse(value: unknown, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(value), {
     status: 200,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
   });
 }
 
-function requestUrl(input: string | URL | Request): string {
-  if (typeof input === "string") return input;
-  return input instanceof URL ? input.href : input.url;
+function mutate(value: string): string {
+  return `${value[0] === "A" ? "B" : "A"}${value.slice(1)}`;
 }
 
-function requestBody(init?: RequestInit): string {
-  if (typeof init?.body !== "string") throw new Error("Expected a JSON request body.");
-  return init.body;
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(sortValue(value));
 }
 
-function sourceKey() {
-  return "web_test_source_12345678";
-}
-
-function availableExperienceFixture(options: { delaySeconds?: number } = {}): QueuedExperience {
-  return {
-    campaignId: "campaign_1",
-    campaignVersionId: "version_1",
-    assignmentId: "assignment_1",
-    exposureId: "exposure_1",
-    presentationHandle: "exposure_1",
-    variantId: "variant_1",
-    placement: "modal",
-    priority: 10,
-    content: {
-      translations: {
-        en: {
-          title: "Complete your order",
-          description: "Your cart is ready.",
-          primaryAction: {
-            id: "primary",
-            label: "Continue",
-            type: "OPEN_INTERNAL_ROUTE",
-            target: "/plans",
-          },
-        },
-      },
-      closeable: true,
-      themePreset: "brand",
-      backgroundToken: "brand",
-      textToken: "inverse",
-      accentToken: "secondary",
-      delaySeconds: options.delaySeconds ?? 0,
-      autoCloseSeconds: null,
-    },
-    assetUrl: "",
-    grant: "v1.payload.signature",
-    defaultLocale: "en",
-    eligibleAt: Date.now(),
-    manifestExpiresAt: Date.now() + 10 * 60_000,
-  };
+function sortValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, nested]) => [key, sortValue(nested)]),
+  );
 }

@@ -1,173 +1,76 @@
 import { createUuid, safeWarn } from "../runtime";
 import type {
+  ConsentState,
   ExperienceActionHandler,
-  ExperienceAvailableHandler,
-  ExperienceConsentResult,
-  ExperienceConsentState,
   ExperienceContext,
   ExperienceDiagnostics,
-  ExperienceDismissal,
-  ExperiencePresentationResult,
+  TestSessionExperienceDecision,
 } from "../types";
 import { loadExperienceRuntime } from "@wts/experience-loader";
 import type { ExperienceRuntime, ExperienceRuntimeDependencies } from "./runtime";
 
-/**
- * A small, synchronous public facade around the lazy Experience runtime.
- *
- * Analytics consumers pay no Experience implementation cost until the feature
- * is explicitly enabled. Handlers registered before the module loads are
- * retained and attached once, so the public client surface stays stable.
- */
+/** Synchronous public facade that preserves lazy loading for Experiences code. */
 export class ExperienceFacade {
   private runtime: ExperienceRuntime | undefined;
   private loading: Promise<ExperienceRuntime> | undefined;
-  private consent: ExperienceConsentState = "pending";
+  private consent: ConsentState = "pending";
   private consentRevision = 0;
   private destroyed = false;
   private lastErrorCode: string | null = null;
   private readonly actionHandlers = new Map<ExperienceActionHandler, () => void>();
-  private readonly availableHandlers = new Map<ExperienceAvailableHandler, () => void>();
   private readonly testDeviceToken = createUuid();
 
   constructor(private readonly dependencies: ExperienceRuntimeDependencies) {}
 
-  async setConsent(consent: ExperienceConsentState): Promise<ExperienceConsentResult> {
-    if (this.destroyed) return { accepted: false, reason: "destroyed" };
-    if (!this.dependencies.options.enabled) return { accepted: false, reason: "feature_disabled" };
-    if (consent === "contextual" || consent === "personalized") {
-      if (this.dependencies.getAnalyticsConsent() !== "granted") {
-        return { accepted: false, reason: "analytics_consent_required" };
-      }
-      if (consent === "personalized" && this.dependencies.getProfileConsent()) {
-        // Identity mutations are FIFO ahead of events. Flush before checking
-        // readiness so an identify call immediately before this method can
-        // establish its server-side binding without a timing race.
-        await this.dependencies.flushIdentity();
-      }
-      if (
-        consent === "personalized" &&
-        (!this.dependencies.getProfileConsent() || !this.dependencies.getProfileIdentityReady())
-      ) {
-        this.lastErrorCode = this.dependencies.getProfileConsent()
-          ? "EXPERIENCE_PROFILE_IDENTITY_REQUIRED"
-          : "EXPERIENCE_PROFILE_CONSENT_REQUIRED";
-        return {
-          accepted: false,
-          reason: this.dependencies.getProfileConsent()
-            ? "profile_identity_required"
-            : "profile_consent_required",
-        };
-      }
-    }
+  async setConsent(consent: ConsentState): Promise<void> {
+    if (this.destroyed) return;
     const revision = ++this.consentRevision;
     this.consent = consent;
-    if (consent === "pending" || consent === "denied") {
-      const runtime = this.runtime;
-      if (runtime) return runtime.setConsent(consent);
-      this.applyDeferredConsent(consent, revision);
-      return { accepted: true };
+    if (consent !== "granted") {
+      if (this.runtime) await this.runtime.setConsent(consent);
+      else this.applyDeferredConsent(consent, revision);
+      return;
     }
-    const runtime = await this.runtimeForActiveOperation();
-    if (!runtime || revision !== this.consentRevision) return { accepted: true };
-    return runtime.setConsent(consent);
+    const runtime = await this.loadRuntime();
+    if (runtime && revision === this.consentRevision) await runtime.setConsent("granted");
   }
 
-  async profileConsentChanged(): Promise<void> {
-    if (!this.dependencies.getProfileConsent() && this.consent === "personalized") {
-      const revision = ++this.consentRevision;
-      this.consent = "pending";
-      this.applyDeferredConsent("pending", revision);
-    }
-    await this.runtime?.profileConsentChanged();
-  }
-
-  async evaluate(context: ExperienceContext): Promise<void> {
-    if (this.consent !== "contextual" && this.consent !== "personalized") return;
-    const runtime = await this.runtimeForActiveOperation();
-    if (!runtime) return;
-    if (runtime.diagnostics().consent !== this.consent) await runtime.setConsent(this.consent);
-    await runtime.evaluate(context);
+  evaluate(context: ExperienceContext): void {
+    if (this.consent !== "granted" || this.destroyed) return;
+    void this.loadRuntime().then((runtime) => {
+      if (!runtime || this.consent !== "granted" || this.destroyed) return;
+      if (runtime.diagnostics().consent !== "granted") void runtime.setConsent("granted");
+      runtime.evaluate(context);
+    });
   }
 
   onAction(handler: ExperienceActionHandler): () => void {
     const unsubscribe = this.runtime?.onAction(handler);
-    if (unsubscribe) this.actionHandlers.set(handler, unsubscribe);
-    else this.actionHandlers.set(handler, () => undefined);
+    this.actionHandlers.set(handler, unsubscribe ?? (() => undefined));
     return () => {
       this.actionHandlers.get(handler)?.();
       this.actionHandlers.delete(handler);
     };
   }
 
-  onAvailable(handler: ExperienceAvailableHandler): () => void {
-    const unsubscribe = this.runtime?.onAvailable(handler);
-    if (unsubscribe) this.availableHandlers.set(handler, unsubscribe);
-    else this.availableHandlers.set(handler, () => undefined);
-    return () => {
-      this.availableHandlers.get(handler)?.();
-      this.availableHandlers.delete(handler);
-    };
-  }
-
-  async acknowledgeExperienceRender(handle: string): Promise<ExperiencePresentationResult> {
-    const runtime = await this.runtimeForManualPresentation();
-    return runtime
-      ? runtime.acknowledgeExperienceRender(handle)
-      : this.manualPresentationUnavailable();
-  }
-
-  async acknowledgeExperienceImpression(handle: string): Promise<ExperiencePresentationResult> {
-    const runtime = await this.runtimeForManualPresentation();
-    return runtime
-      ? runtime.acknowledgeExperienceImpression(handle)
-      : this.manualPresentationUnavailable();
-  }
-
-  async reportExperienceAction(
-    handle: string,
-    actionId: string,
-  ): Promise<ExperiencePresentationResult> {
-    const runtime = await this.runtimeForManualPresentation();
-    return runtime
-      ? runtime.reportExperienceAction(handle, actionId)
-      : this.manualPresentationUnavailable();
-  }
-
-  async dismissExperience(
-    handle: string,
-    outcome?: ExperienceDismissal,
-  ): Promise<ExperiencePresentationResult> {
-    const runtime = await this.runtimeForManualPresentation();
-    return runtime
-      ? runtime.dismissExperience(handle, outcome)
-      : this.manualPresentationUnavailable();
-  }
-
-  async failExperiencePresentation(
-    handle: string,
-    failureCode: string,
-  ): Promise<ExperiencePresentationResult> {
-    return this.dismissExperience(handle, { failureCode });
-  }
-
-  async presentNext(): Promise<boolean> {
-    if (this.dependencies.options.renderMode !== "automatic") return false;
-    const runtime = await this.runtimeForActiveOperation();
-    return runtime ? runtime.presentNext() : false;
-  }
-
   async dismissCurrent(): Promise<boolean> {
-    const runtime = await this.runtimeForActiveOperation();
-    return runtime ? runtime.dismissCurrent() : false;
+    return this.runtime?.dismissCurrent() ?? false;
+  }
+
+  async presentTestExperience(
+    decision: TestSessionExperienceDecision,
+    onInteraction: (interaction: "impression" | "action") => void,
+  ): Promise<boolean> {
+    const runtime = await this.loadRuntime();
+    return runtime?.presentTestExperience(decision, onInteraction) ?? false;
   }
 
   diagnostics(): ExperienceDiagnostics {
     return (
       this.runtime?.diagnostics() ?? {
-        enabled: this.dependencies.options.enabled,
+        enabled: true,
         consent: this.consent,
-        renderMode: this.dependencies.options.renderMode,
+        decisionMode: null,
         manifestVersion: null,
         manifestExpiresAt: null,
         queued: 0,
@@ -184,9 +87,6 @@ export class ExperienceFacade {
   }
 
   async reset(): Promise<void> {
-    const revision = ++this.consentRevision;
-    this.consent = "pending";
-    this.applyDeferredConsent("pending", revision);
     await this.runtime?.reset();
   }
 
@@ -198,51 +98,14 @@ export class ExperienceFacade {
     this.destroyed = true;
     this.consentRevision += 1;
     for (const unsubscribe of this.actionHandlers.values()) unsubscribe();
-    for (const unsubscribe of this.availableHandlers.values()) unsubscribe();
     this.actionHandlers.clear();
-    this.availableHandlers.clear();
     this.runtime?.destroy();
     void this.loading?.then((runtime) => runtime.destroy()).catch(() => undefined);
   }
 
-  private async runtimeForActiveOperation(): Promise<ExperienceRuntime | undefined> {
-    if (!this.dependencies.options.enabled || this.destroyed) return undefined;
-    if (this.consent === "pending" || this.consent === "denied") return this.runtime;
-    return this.loadRuntime();
-  }
-
-  private async runtimeForManualPresentation(): Promise<ExperienceRuntime | undefined> {
-    const unavailable = this.manualPresentationPrecondition();
-    if (unavailable) return undefined;
-    return this.loadRuntime();
-  }
-
-  private manualPresentationPrecondition(): ExperiencePresentationResult | undefined {
-    if (this.destroyed) return { accepted: false, idempotent: false, code: "destroyed" };
-    if (!this.dependencies.options.enabled) {
-      return { accepted: false, idempotent: false, code: "feature_disabled" };
-    }
-    if (this.dependencies.options.renderMode !== "manual") {
-      return { accepted: false, idempotent: false, code: "manual_mode_required" };
-    }
-    if (this.consent !== "contextual" && this.consent !== "personalized") {
-      return { accepted: false, idempotent: false, code: "consent_required" };
-    }
-    return undefined;
-  }
-
-  private manualPresentationUnavailable(): ExperiencePresentationResult {
-    return (
-      this.manualPresentationPrecondition() ?? {
-        accepted: false,
-        idempotent: false,
-        code: "presentation_not_found",
-      }
-    );
-  }
-
   private async loadRuntime(): Promise<ExperienceRuntime | undefined> {
     if (this.runtime) return this.runtime;
+    if (this.destroyed || this.consent !== "granted") return undefined;
     if (!this.loading) {
       const input: ExperienceRuntimeDependencies = {
         ...this.dependencies,
@@ -250,12 +113,13 @@ export class ExperienceFacade {
       };
       const pending = loadExperienceRuntime(input)
         .then((runtime) => {
-          if (this.destroyed) {
-            runtime.destroy();
-            return runtime;
+          if (this.destroyed) runtime.destroy();
+          else {
+            this.runtime = runtime;
+            for (const handler of this.actionHandlers.keys()) {
+              this.actionHandlers.set(handler, runtime.onAction(handler));
+            }
           }
-          this.runtime = runtime;
-          this.attachHandlers(runtime);
           return runtime;
         })
         .catch((error: unknown) => {
@@ -277,16 +141,7 @@ export class ExperienceFacade {
     }
   }
 
-  private attachHandlers(runtime: ExperienceRuntime): void {
-    for (const handler of this.actionHandlers.keys()) {
-      this.actionHandlers.set(handler, runtime.onAction(handler));
-    }
-    for (const handler of this.availableHandlers.keys()) {
-      this.availableHandlers.set(handler, runtime.onAvailable(handler));
-    }
-  }
-
-  private applyDeferredConsent(consent: "pending" | "denied", revision: number): void {
+  private applyDeferredConsent(consent: Exclude<ConsentState, "granted">, revision: number): void {
     void this.loading
       ?.then((runtime) => {
         if (!this.destroyed && this.consentRevision === revision) {

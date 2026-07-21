@@ -12,6 +12,8 @@ permissions:
 jobs:
   publish:
     environment: release
+    env:
+      WTS_EXPERIENCE_ROOT_PUBLIC_KEY: ${{ vars.WTS_EXPERIENCE_ROOT_PUBLIC_KEY }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -21,6 +23,7 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - run: npm ci
+      - run: node scripts/verify-release-root.mjs
       - run: npm run verify
       - run: node scripts/publish-release.test.mjs
       - name: Verify tag and package versions match

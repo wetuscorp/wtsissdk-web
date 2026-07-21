@@ -7,6 +7,11 @@ const iifeTestSessionLoader = fileURLToPath(
 const iifeExperienceLoader = fileURLToPath(
   new URL("./src/experiences/loader.iife.ts", import.meta.url),
 );
+const trustDefine = {
+  __WTS_EXPERIENCE_ROOT_PUBLIC_KEY__: JSON.stringify(
+    process.env.WTS_EXPERIENCE_ROOT_PUBLIC_KEY?.trim() ?? "",
+  ),
+};
 
 export default defineConfig([
   {
@@ -19,6 +24,7 @@ export default defineConfig([
     target: "es2020",
     splitting: true,
     treeshake: true,
+    define: trustDefine,
   },
   {
     entry: { index: "src/index.ts" },
@@ -30,6 +36,7 @@ export default defineConfig([
     target: "es2020",
     splitting: false,
     treeshake: true,
+    define: trustDefine,
   },
   {
     entry: { "wts-web": "src/iife.ts" },
@@ -41,6 +48,7 @@ export default defineConfig([
     target: "es2020",
     splitting: false,
     treeshake: true,
+    define: trustDefine,
     esbuildOptions(options) {
       options.alias = {
         ...options.alias,
@@ -59,6 +67,7 @@ export default defineConfig([
     target: "es2020",
     splitting: false,
     treeshake: true,
+    define: trustDefine,
   },
   {
     entry: { "wts-web-test-session": "src/test-session-iife.ts" },
@@ -70,5 +79,6 @@ export default defineConfig([
     target: "es2020",
     splitting: false,
     treeshake: true,
+    define: trustDefine,
   },
 ]);

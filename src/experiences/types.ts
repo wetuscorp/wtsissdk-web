@@ -3,8 +3,9 @@ import type {
   ExperienceContent,
   ExperienceContext,
   ExperiencePlacement,
-  StoredExperienceInteraction,
   Scalar,
+  StoredExperienceInteraction,
+  StoredExperienceManifest,
   WtsExperience,
 } from "../types";
 
@@ -12,14 +13,6 @@ export interface ExperienceMetadata {
   platform: "web";
   sdkVersion: string;
   locale: string;
-}
-
-export interface ExperienceSettings {
-  allowedInternalRoutes: string[];
-  allowedCallbackKeys: string[];
-  allowedDeepLinkHosts: string[];
-  allowedDeepLinkSchemes: string[];
-  allowedWebOrigins: string[];
 }
 
 export interface ManifestBranch {
@@ -53,28 +46,31 @@ export interface ManifestCampaign {
 }
 
 export interface ExperienceManifest {
-  schemaVersion: 1;
+  schemaVersion: 2;
   sourceId: string;
-  /** Public source key, signed to prevent cross-source manifest replay. */
   sourceKey: string;
-  sourceManifestVersion: number;
+  manifestVersion: number;
   environment?: "production" | "staging" | "development";
   generatedAt: string;
+  issuedAt: string;
   expiresAt: string;
   campaigns: ManifestCampaign[];
 }
 
+export type OnlineKeyset = StoredExperienceManifest["onlineKeyset"];
+
 export interface BootstrapResponse {
-  /** Ignored by the SDK. Only `signedPayload` is trusted after verification. */
+  onlineKeyset: OnlineKeyset;
   manifest: unknown;
-  /** Base64url UTF-8 JSON. It must be signature-verified before parsing. */
   signedPayload: string;
   signature: string;
-  /** Signing key id (the `kid` used to look up the configured public key). */
   keyId: string;
-  /** Ignored by the SDK; expiry is taken from the verified payload. */
   expiresAt: string;
 }
+
+export type BootstrapFetchResult =
+  | { notModified: true; etag?: string }
+  | { notModified: false; response: BootstrapResponse; etag?: string };
 
 export interface ExperienceDecision {
   campaignId: string;
@@ -94,6 +90,7 @@ export interface ExperienceDecision {
 }
 
 export interface DecisionResponse {
+  mode: "contextual" | "personalized";
   decisions: ExperienceDecision[];
   serverTime: string;
 }
@@ -111,14 +108,13 @@ export type TargetNode =
   | { kind: "not"; condition: TargetNode };
 
 export interface QueuedExperience extends WtsExperience {
-  /** Local opaque reference. It is the only public representation of exposureId. */
-  presentationHandle: string;
   exposureId: string;
   grant: string;
   defaultLocale: string;
   eligibleAt: number;
   /** Epoch milliseconds from the verified signed manifest. Never render after this point. */
   manifestExpiresAt: number;
+  frequency: { session: number; daily: number };
   triggerEventId?: string;
 }
 

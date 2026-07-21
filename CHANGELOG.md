@@ -2,17 +2,23 @@
 
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and Semantic Versioning.
 
-## Unreleased
+## 0.5.0-alpha.1
 
-- Applied signed Experience semantic background, text, and accent tokens through
-  a closed renderer-owned CSS vocabulary; arbitrary CSS values remain ignored.
-- Kept an automatic Experience visible and unrecorded when an allowlisted
-  `CUSTOM_CALLBACK` has no host handler that accepts it.
-- Allowed asynchronous manual presentation handlers and captured their failures
-  as deterministic Experience diagnostics.
-- Prevented verified-manifest expiry from rendering a stale queued candidate.
-- Cleared pending Experience interactions when `resetIdentity()` creates a new
-  anonymous actor.
+- Replaced separate analytics/profile/Experience decisions with persisted
+  `pending | granted | denied` consent and `getConsentState()`.
+- Added Experiences Protocol V2 root/keyset/leaf verification, source replay
+  defense, 60-second foreground refresh, ETag single-flight, and ten-minute
+  offline fail-closed manifests.
+- Made the automatic renderer the only renderer and removed host manifest keys,
+  action allowlists, manual lifecycle APIs, and Experience-specific init.
+- Added handled/unhandled action outcomes; unhandled advanced actions remain open.
+- Added isolated automatic SDK Test Session V2 Experience rendering.
+- Embedded the Experiences companion SHA-384 pin in the primary IIFE at build time.
+- Cleared 0.4 storage on first 0.5 initialization without migrating old consent.
+- Applied signed Experience semantic colour tokens through a closed renderer-owned
+  CSS vocabulary; arbitrary CSS values remain ignored.
+- Prevented verified-manifest expiry from rendering a stale queued candidate and
+  cleared pending Experience interactions when identity changes.
 
 ## 0.4.0-alpha.1
 

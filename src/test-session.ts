@@ -5,7 +5,6 @@ import { HttpTestSessionTransport, TransportError } from "./transport";
 import type {
   ConsentState,
   EventProperties,
-  ExperienceConsentState,
   Revenue,
   TestSessionCheck,
   TestSessionDiagnostics,
@@ -35,7 +34,7 @@ type ActiveSession = {
 };
 
 type PersistedTestSession = {
-  version: 1;
+  version: 2;
   active: ActiveSession;
   pendingSignals: TestSessionSignal[];
 };
@@ -45,10 +44,12 @@ export interface TestSessionRuntimeInput {
   collectorOrigin: string;
   timeoutMs: number;
   debug: boolean;
-  getAnalyticsConsent: () => ConsentState;
-  getProfileConsent: () => boolean;
-  getExperienceConsent: () => ExperienceConsentState;
+  getConsent: () => ConsentState;
   experiencesEnabled: () => boolean;
+  presentTestExperience?: (
+    decision: TestSessionExperienceDecision,
+    onInteraction: (interaction: "impression" | "action") => void,
+  ) => Promise<boolean>;
   transport?: TestSessionTransport;
 }
 
@@ -77,12 +78,12 @@ export class TestSessionRuntime {
     const transport = this.transport();
     try {
       const paired = await transport.pair(this.input.sourceKey, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         ...credential,
         metadata: this.metadata(),
       });
       const handshake = await transport.handshake(this.input.sourceKey, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         participantId: paired.participant.id,
         sessionToken: paired.sessionToken,
         metadata: this.metadata(),
@@ -136,7 +137,7 @@ export class TestSessionRuntime {
     }
     try {
       const result = await this.transport().leave(this.input.sourceKey, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         participantId: active.participantId,
         sessionToken: active.sessionToken,
       });
@@ -154,7 +155,7 @@ export class TestSessionRuntime {
     validateProbeUrl(url);
     try {
       const result = await this.transport().resolve(this.input.sourceKey, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         participantId: active.participantId,
         sessionToken: active.sessionToken,
         url,
@@ -217,14 +218,6 @@ export class TestSessionRuntime {
 
   observeConsent(): void {
     this.record({ type: "consent", outcome: "observed", feature: "analytics" });
-  }
-
-  observeExperienceConsent(): void {
-    this.record({ type: "consent", outcome: "observed", feature: "experiences" });
-  }
-
-  observeProfileConsent(): void {
-    this.record({ type: "consent", outcome: "observed", feature: "profile" });
   }
 
   observeExperienceInteraction(
@@ -303,7 +296,7 @@ export class TestSessionRuntime {
     } else {
       try {
         const decision = await this.transport().decideExperience(this.input.sourceKey, {
-          schemaVersion: 1,
+          schemaVersion: 2,
           participantId: active.participantId,
           sessionToken: active.sessionToken,
           context: {
@@ -317,7 +310,15 @@ export class TestSessionRuntime {
         if (decision.outcome === "ready") {
           this.active = { ...active, testExperienceDecisionReady: true };
           this.persist();
-          emitted.push("experiences");
+          const presented = await this.input.presentTestExperience?.(decision, (interaction) => {
+            this.record({
+              type: interaction === "impression" ? "experience_impression" : "experience_action",
+              outcome: "observed",
+              feature: "experiences",
+            });
+          });
+          if (presented === false) skipped.push("experiences");
+          else emitted.push("experiences");
         } else {
           skipped.push("experiences");
         }
@@ -406,7 +407,7 @@ export class TestSessionRuntime {
     const signals = this.pendingSignals.slice(0, MAX_PENDING_SIGNALS);
     try {
       const response = await this.transport().signals(this.input.sourceKey, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         participantId: active.participantId,
         sessionToken: active.sessionToken,
         signals,
@@ -454,11 +455,7 @@ export class TestSessionRuntime {
   }
 
   private consent() {
-    return {
-      analytics: this.input.getAnalyticsConsent(),
-      profile: this.input.getProfileConsent(),
-      experience: this.input.getExperienceConsent(),
-    };
+    return this.input.getConsent();
   }
 
   private capabilities() {
@@ -484,7 +481,7 @@ export class TestSessionRuntime {
       return;
     }
     savePersistedTestSession(this.input.sourceKey, {
-      version: 1,
+      version: 2,
       active,
       pendingSignals: this.pendingSignals,
     });
@@ -606,7 +603,7 @@ function loadPersistedTestSession(sourceKey: string): PersistedTestSession | und
     ) as unknown;
     if (!isPersistedTestSession(value)) return undefined;
     return {
-      version: 1,
+      version: 2,
       active: {
         ...value.active,
         checks: value.active.checks.map((check) => ({ ...check })),
@@ -642,7 +639,7 @@ function clearPersistedTestSession(sourceKey: string): void {
 function isPersistedTestSession(value: unknown): value is PersistedTestSession {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<PersistedTestSession>;
-  if (candidate.version !== 1 || !candidate.active || !Array.isArray(candidate.pendingSignals))
+  if (candidate.version !== 2 || !candidate.active || !Array.isArray(candidate.pendingSignals))
     return false;
   const active = candidate.active;
   return (

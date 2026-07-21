@@ -1,29 +1,24 @@
 import { MAX_BATCH_BYTES, MAX_BATCH_EVENTS, SDK_VERSION } from "../constants";
 import { byteLength, createUuid, locale, safeWarn } from "../runtime";
 import { TransportError } from "../transport";
-import { isUnsafeDeepLinkScheme } from "../validation";
-import { verifyExperienceManifestPayload } from "./manifest-verifier";
 import type {
   ConsentState,
   ExperienceAction,
   ExperienceActionHandler,
-  ExperienceAvailableHandler,
-  ExperienceConsentResult,
-  ExperienceConsentState,
-  ExperienceDismissal,
   ExperienceContext,
   ExperienceDiagnostics,
-  ExperienceOptions,
-  ExperiencePresentationResult,
+  ExperienceContent,
   Identity,
   StorageAdapter,
+  StoredExperienceManifest,
+  TestSessionExperienceDecision,
   WtsExperience,
-  WtsExperienceManualPresentation,
 } from "../types";
+import { isUnsafeDeepLinkScheme } from "../validation";
+import { verifyExperienceManifestPayload } from "./manifest-verifier";
 import type { RenderHandle } from "./renderer";
 import { ExperienceTransport } from "./transport";
 import type {
-  BootstrapResponse,
   ExperienceDecision,
   ExperienceInteraction,
   ExperienceManifest,
@@ -33,56 +28,49 @@ import type {
   TargetNode,
 } from "./types";
 
-type ResolvedExperienceOptions = Required<ExperienceOptions>;
-
 export interface ExperienceRuntimeDependencies {
   sourceKey: string;
   collectorOrigin: string;
   timeoutMs: number;
   debug: boolean;
-  options: ResolvedExperienceOptions;
-  getAnalyticsConsent(): ConsentState;
-  getProfileConsent(): boolean;
-  /** True only after an identify mutation was accepted by the collector. */
-  getProfileIdentityReady(): boolean;
+  getConsent(): ConsentState;
   getIdentity(): Identity | undefined;
   getStorage(): StorageAdapter | undefined;
-  flushIdentity(): Promise<unknown>;
+  /** Unit-test trust override; release builds use the embedded root. */
+  rootPublicKey?: string;
   /** A facade-owned, per-client opaque token for unpublished device tests. */
   testDeviceToken?: string;
   onInteraction?(type: ExperienceInteraction["type"]): void;
 }
 
-const MANIFEST_CACHE_MS = 5 * 60_000;
+const REFRESH_INTERVAL_MS = 60_000;
 const MAX_CANDIDATES = 5;
 const MAX_SESSION_OVERLAYS = 2;
 const MAX_SESSION_IMPRESSIONS = 5;
-const MAX_MANUAL_PRESENTATION_HISTORY = 50;
-
-interface ManualPresentationState {
-  rendered: boolean;
-  impressionRecorded: boolean;
-  dismissed: boolean;
-  actions: Set<string>;
-}
+const PRESENTATION_COOLDOWN_MS = 3_000;
 
 export class ExperienceRuntime {
-  private consent: ExperienceConsentState = "pending";
+  private consent: ConsentState = "pending";
+  private decisionMode: "contextual" | "personalized" | null = null;
   private readonly transport: ExperienceTransport;
   private manifest: ExperienceManifest | undefined;
   private manifestLoadedAt = 0;
+  private manifestEtag: string | undefined;
+  private cacheLoaded = false;
+  private refreshFlight: Promise<boolean> | undefined;
+  private refreshTimer: ReturnType<typeof setInterval> | undefined;
   private queue: QueuedExperience[] = [];
   private current: QueuedExperience | undefined;
   private renderHandle: RenderHandle | undefined;
   private renderAbortController: AbortController | undefined;
-  private readonly reportedImpressionHandles = new Set<string>();
-  private readonly reportedActionHandles = new Set<string>();
-  private readonly manualPresentations = new Map<string, ManualPresentationState>();
-  private manualOfferedHandle: string | undefined;
-  private actionHandlers = new Set<ExperienceActionHandler>();
-  private availableHandlers = new Set<ExperienceAvailableHandler>();
-  private retryTimer: ReturnType<typeof setTimeout> | undefined;
+  private testRenderHandle: RenderHandle | undefined;
+  private testRenderAbortController: AbortController | undefined;
   private nextPresentationTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly reportedImpressions = new Set<string>();
+  private readonly recordedBranches = new Set<string>();
+  private readonly actionHandlers = new Set<ExperienceActionHandler>();
+  private readonly sessionCampaignImpressions = new Map<string, number>();
+  private retryTimer: ReturnType<typeof setTimeout> | undefined;
   private retryAttempt = 0;
   private cooldownUntil = 0;
   private sessionImpressions = 0;
@@ -101,51 +89,22 @@ export class ExperienceRuntime {
     );
   }
 
-  async setConsent(consent: ExperienceConsentState): Promise<ExperienceConsentResult> {
-    if (this.destroyed) return { accepted: false, reason: "destroyed" };
-    if (!this.dependencies.options.enabled) {
-      return { accepted: false, reason: "feature_disabled" };
-    }
-    if (consent === "denied" || consent === "pending") {
-      this.consent = consent;
-      await this.clearRuntimeState(true);
-      return { accepted: true };
-    }
-    if (this.dependencies.getAnalyticsConsent() !== "granted") {
-      return { accepted: false, reason: "analytics_consent_required" };
-    }
-    if (consent === "personalized" && this.dependencies.getProfileConsent()) {
-      await this.dependencies.flushIdentity();
-    }
-    if (
-      consent === "personalized" &&
-      (!this.dependencies.getProfileConsent() || !this.dependencies.getProfileIdentityReady())
-    ) {
-      this.lastErrorCode = this.dependencies.getProfileConsent()
-        ? "EXPERIENCE_PROFILE_IDENTITY_REQUIRED"
-        : "EXPERIENCE_PROFILE_CONSENT_REQUIRED";
-      return {
-        accepted: false,
-        reason: this.dependencies.getProfileConsent()
-          ? "profile_identity_required"
-          : "profile_consent_required",
-      };
-    }
+  async setConsent(consent: ConsentState): Promise<void> {
+    if (this.destroyed) return;
     this.consent = consent;
+    if (consent !== "granted") {
+      this.stopRefreshLoop();
+      await this.clearRuntimeState(true, true);
+      return;
+    }
+    this.startRefreshLoop();
     try {
-      await this.ensureManifest(true);
+      await this.loadCachedManifest();
+      await this.refreshManifest();
       await this.flushInteractions();
-      return { accepted: true };
     } catch (error) {
       this.handleError(error);
-      return { accepted: true };
     }
-  }
-
-  async profileConsentChanged(): Promise<void> {
-    if (this.dependencies.getProfileConsent() || this.consent !== "personalized") return;
-    this.consent = "pending";
-    await this.clearRuntimeState(true);
   }
 
   onAction(handler: ExperienceActionHandler): () => void {
@@ -153,72 +112,12 @@ export class ExperienceRuntime {
     return () => this.actionHandlers.delete(handler);
   }
 
-  onAvailable(handler: ExperienceAvailableHandler): () => void {
-    this.availableHandlers.add(handler);
-    this.offerNextManualCandidate();
-    return () => this.availableHandlers.delete(handler);
-  }
-
-  async evaluate(context: ExperienceContext): Promise<void> {
+  evaluate(context: ExperienceContext): void {
     if (!this.canEvaluate()) return;
-    let manifest: ExperienceManifest | undefined;
-    try {
-      manifest = await this.ensureManifest();
-    } catch (error) {
-      this.handleError(error);
-      return;
-    }
-    if (!manifest) return;
-    const runtimeContext: RuntimeContext = {
-      ...(context.pathname ? { pathname: context.pathname } : {}),
-      ...(context.pageName ? { pageName: context.pageName } : {}),
-      ...(context.eventKey ? { eventKey: context.eventKey } : {}),
-      properties: context.properties,
-      ...(context.triggerEventId ? { triggerEventId: context.triggerEventId } : {}),
-    };
-    if (this.consent === "personalized") {
-      try {
-        await this.dependencies.flushIdentity();
-        if (
-          !this.canEvaluate() ||
-          !this.dependencies.getProfileConsent() ||
-          !this.dependencies.getProfileIdentityReady()
-        ) {
-          return;
-        }
-        const response = await this.transport.decide({
-          consent: this.consent,
-          profileConsentGranted: this.dependencies.getProfileConsent(),
-          identity: this.requireIdentity(),
-          metadata: this.metadata,
-          settings: this.settings,
-          testDeviceToken: this.testDeviceToken,
-          candidateVersionIds: manifest.campaigns.map((item) => item.campaignVersionId),
-          context: { ...runtimeContext, trigger: context.trigger },
-        });
-        await this.acceptDecisions(
-          response.decisions,
-          runtimeContext,
-          Date.parse(manifest.expiresAt),
-        );
-      } catch (error) {
-        this.handleError(error);
-      }
-      return;
-    }
-    const candidates = manifest.campaigns
-      .filter((campaign) => !campaign.requiresPersonalization)
-      .filter((campaign) => triggerMatches(campaign, runtimeContext))
-      .filter((campaign) => targetingMatches(campaign.targeting, manifest, this.metadata.locale))
-      .sort(compareCampaigns);
-    const manifestExpiresAt = Date.parse(manifest.expiresAt);
-    for (const campaign of candidates) {
-      await this.acceptManifestCampaign(campaign, runtimeContext, manifestExpiresAt);
-    }
+    void this.evaluateInBackground(context);
   }
 
   async presentNext(): Promise<boolean> {
-    if (this.dependencies.options.renderMode !== "automatic") return false;
     this.discardExpiredCandidates();
     if (
       !this.canEvaluate() ||
@@ -236,14 +135,15 @@ export class ExperienceRuntime {
     if (isOverlayPlacement(candidate.placement) && this.sessionOverlays >= MAX_SESSION_OVERLAYS) {
       return this.presentNext();
     }
-    this.admitOverlay(candidate);
+    if (!isWebPlacement(candidate.placement)) return this.presentNext();
+    if (isOverlayPlacement(candidate.placement)) this.sessionOverlays += 1;
     this.current = candidate;
     await this.record(candidate, "render_started");
     const controller = new AbortController();
     this.renderAbortController = controller;
     try {
       const renderer = await import("./renderer");
-      const renderHandle = await renderer.renderExperience(candidate, {
+      const handle = await renderer.renderExperience(candidate, {
         locale: this.metadata.locale,
         signal: controller.signal,
         onAction: (action) => void this.handleAction(candidate, action),
@@ -255,10 +155,10 @@ export class ExperienceRuntime {
         !this.canEvaluate() ||
         this.current?.exposureId !== candidate.exposureId
       ) {
-        renderHandle.dismiss("dismissed", false);
+        handle.dismiss("dismissed", false);
         return false;
       }
-      this.renderHandle = renderHandle;
+      this.renderHandle = handle;
       await this.record(candidate, "render_succeeded");
       return true;
     } catch (error) {
@@ -266,11 +166,9 @@ export class ExperienceRuntime {
         if (this.current?.exposureId === candidate.exposureId) this.clearCurrentPresentation();
         return false;
       }
-      await this.record(candidate, "render_failed", {
-        failureCode: normalizeErrorCode(error),
-      });
+      await this.record(candidate, "render_failed", { failureCode: normalizeErrorCode(error) });
       this.clearCurrentPresentation();
-      this.cooldownUntil = Date.now() + 3_000;
+      this.cooldownUntil = Date.now() + PRESENTATION_COOLDOWN_MS;
       this.scheduleNextPresentation();
       this.handleError(error);
       return false;
@@ -280,122 +178,91 @@ export class ExperienceRuntime {
   }
 
   async dismissCurrent(): Promise<boolean> {
+    if (this.testRenderHandle) {
+      this.testRenderHandle.dismiss("dismissed");
+      this.testRenderHandle = undefined;
+      return true;
+    }
     if (!this.current || !this.renderHandle) return false;
     this.renderHandle.dismiss("dismissed");
     return true;
   }
 
-  async acknowledgeExperienceRender(handle: string): Promise<ExperiencePresentationResult> {
-    const unavailable = this.manualPresentationUnavailable();
-    if (unavailable) return unavailable;
-    if (this.discardExpiredCandidates().has(handle)) {
-      return this.presentationRejected("manifest_expired");
+  async presentTestExperience(
+    decision: TestSessionExperienceDecision,
+    onInteraction: (interaction: "impression" | "action") => void,
+  ): Promise<boolean> {
+    if (
+      !this.canEvaluate() ||
+      this.current ||
+      this.testRenderHandle ||
+      decision.outcome !== "ready" ||
+      !decision.testGrant ||
+      Date.parse(decision.testGrant.expiresAt) <= Date.now() ||
+      !decision.decision?.variant ||
+      !isWebPlacementValue(decision.decision.placement) ||
+      !isExperienceContent(decision.decision.variant.content)
+    ) {
+      return false;
     }
-    const state = this.manualPresentations.get(handle);
-    if (!state) return this.presentationRejected("presentation_not_found");
-    if (state.rendered) return this.presentationAccepted(true);
-    if (state.dismissed) return this.presentationRejected("presentation_not_presenting");
-    if (this.manualOfferedHandle !== handle || this.queue[0]?.presentationHandle !== handle) {
-      return this.presentationRejected("presentation_not_presenting");
+    const assetUrl = decision.decision.variant.asset?.url;
+    const candidate: QueuedExperience = {
+      campaignId: decision.decision.campaignId,
+      campaignVersionId: decision.decision.campaignVersionId,
+      assignmentId: null,
+      variantId: decision.decision.variant.id,
+      exposureId: createUuid(),
+      placement: decision.decision.placement,
+      priority: Number.MAX_SAFE_INTEGER,
+      content: decision.decision.variant.content,
+      ...(safeAssetUrl(assetUrl) ? { assetUrl } : {}),
+      grant: "isolated-test-session",
+      defaultLocale: decision.decision.defaultLocale,
+      eligibleAt: Date.now(),
+      manifestExpiresAt: Date.parse(decision.testGrant.expiresAt),
+      frequency: { session: 1, daily: 1 },
+    };
+    const controller = new AbortController();
+    this.testRenderAbortController = controller;
+    try {
+      const renderer = await import("./renderer");
+      const handle = await renderer.renderExperience(candidate, {
+        locale: this.metadata.locale,
+        signal: controller.signal,
+        onAction: (action) => {
+          void this.handleTestAction(candidate, action, onInteraction);
+        },
+        onDismiss: () => {
+          this.testRenderHandle = undefined;
+        },
+        onImpression: () => onInteraction("impression"),
+      });
+      if (controller.signal.aborted || !this.canEvaluate()) {
+        handle.dismiss("dismissed", false);
+        return false;
+      }
+      this.testRenderHandle = handle;
+      return true;
+    } catch (error) {
+      if (!isAbortError(error)) this.handleError(error);
+      return false;
+    } finally {
+      if (this.testRenderAbortController === controller) {
+        this.testRenderAbortController = undefined;
+      }
     }
-    if (this.current) return this.presentationRejected("presentation_not_presenting");
-    const candidate = this.queue.shift()!;
-    if (!this.canAdmitOverlay(candidate)) {
-      this.manualOfferedHandle = undefined;
-      state.dismissed = true;
-      this.scheduleNextPresentation();
-      return this.presentationRejected("session_overlay_limit_reached");
-    }
-    this.admitOverlay(candidate);
-    this.manualOfferedHandle = undefined;
-    this.current = candidate;
-    state.rendered = true;
-    await this.record(candidate, "render_started");
-    await this.record(candidate, "render_succeeded");
-    return this.presentationAccepted(false);
-  }
-
-  async acknowledgeExperienceImpression(handle: string): Promise<ExperiencePresentationResult> {
-    const unavailable = this.manualPresentationUnavailable();
-    if (unavailable) return unavailable;
-    const state = this.manualPresentations.get(handle);
-    if (!state) return this.presentationRejected("presentation_not_found");
-    if (state.impressionRecorded) return this.presentationAccepted(true);
-    const candidate = this.activeManualPresentation(handle);
-    if (!candidate) return this.presentationRejected("presentation_not_presenting");
-    await this.recordImpression(candidate);
-    state.impressionRecorded = true;
-    return this.presentationAccepted(false);
-  }
-
-  async reportExperienceAction(
-    handle: string,
-    actionId: string,
-  ): Promise<ExperiencePresentationResult> {
-    const unavailable = this.manualPresentationUnavailable();
-    if (unavailable) return unavailable;
-    const state = this.manualPresentations.get(handle);
-    if (!state) return this.presentationRejected("presentation_not_found");
-    if (state.actions.has(actionId) || this.reportedActionHandles.has(`${handle}:${actionId}`)) {
-      return this.presentationAccepted(true);
-    }
-    const candidate = this.activeManualPresentation(handle);
-    if (!candidate) return this.presentationRejected("presentation_not_presenting");
-    const action = findExperienceAction(candidate, actionId);
-    if (!action) return this.presentationRejected("invalid_action");
-    const actionHandle = `${handle}:${actionId}`;
-    state.actions.add(actionId);
-    this.reportedActionHandles.add(actionHandle);
-    await this.record(candidate, action.primary ? "primary_action" : "secondary_action", {
-      actionId,
-    });
-    return this.presentationAccepted(false);
-  }
-
-  async dismissExperience(
-    handle: string,
-    outcome: ExperienceDismissal = {},
-  ): Promise<ExperiencePresentationResult> {
-    const unavailable = this.manualPresentationUnavailable();
-    if (unavailable) return unavailable;
-    const state = this.manualPresentations.get(handle);
-    if (!state) return this.presentationRejected("presentation_not_found");
-    if (state.dismissed) return this.presentationAccepted(true);
-    const candidate = this.activeManualPresentation(handle);
-    if (!candidate) return this.presentationRejected("presentation_not_presenting");
-    if (outcome.failureCode && !isValidFailureCode(outcome.failureCode)) {
-      return this.presentationRejected("invalid_failure_code");
-    }
-    state.dismissed = true;
-    if (outcome.failureCode) {
-      await this.record(candidate, "render_failed", { failureCode: outcome.failureCode });
-      this.clearCurrentPresentation();
-      this.cooldownUntil = Date.now() + 3_000;
-      this.scheduleNextPresentation();
-    } else {
-      await this.finish(candidate, outcome.reason ?? "dismissed");
-    }
-    return this.presentationAccepted(false);
-  }
-
-  /** @deprecated Use dismissExperience(handle, { failureCode }) instead. */
-  async failExperiencePresentation(
-    handle: string,
-    failureCode: string,
-  ): Promise<ExperiencePresentationResult> {
-    return this.dismissExperience(handle, { failureCode });
   }
 
   diagnostics(): ExperienceDiagnostics {
     this.discardExpiredCandidates();
     return {
-      enabled: this.dependencies.options.enabled,
+      enabled: true,
       consent: this.consent,
-      renderMode: this.dependencies.options.renderMode,
-      manifestVersion: this.manifest?.sourceManifestVersion ?? null,
+      decisionMode: this.decisionMode,
+      manifestVersion: this.manifest?.manifestVersion ?? null,
       manifestExpiresAt: this.manifest?.expiresAt ?? null,
       queued: this.queue.length,
-      presenting: Boolean(this.current),
+      presenting: Boolean(this.current || this.testRenderHandle),
       sessionImpressions: this.sessionImpressions,
       testDeviceToken: this.testDeviceToken,
       lastErrorCode: this.lastErrorCode,
@@ -411,8 +278,6 @@ export class ExperienceRuntime {
     if (interactions.length === 0) return;
     try {
       const result = await this.transport.sendInteractions({
-        consent: this.activeConsent,
-        profileConsentGranted: this.dependencies.getProfileConsent(),
         identity: this.requireIdentity(),
         interactions,
       });
@@ -424,8 +289,9 @@ export class ExperienceRuntime {
       if (result.rejected.some((item) => item.retryable)) this.scheduleRetry();
       else {
         this.retryAttempt = 0;
-        const pending = await storage.load();
-        if (pending.experienceQueue.length > 0) queueMicrotask(() => void this.flushInteractions());
+        if ((await storage.load()).experienceQueue.length > 0) {
+          queueMicrotask(() => void this.flushInteractions());
+        }
       }
     } catch (error) {
       if (error instanceof TransportError && !error.retryable) {
@@ -440,82 +306,171 @@ export class ExperienceRuntime {
   }
 
   async reset(): Promise<void> {
-    await this.clearRuntimeState(true);
-    this.consent = "pending";
+    await this.clearRuntimeState(true, true);
     this.sessionImpressions = 0;
     this.sessionOverlays = 0;
-    this.reportedImpressionHandles.clear();
-    this.reportedActionHandles.clear();
+    this.sessionCampaignImpressions.clear();
+    if (this.canEvaluate()) {
+      this.startRefreshLoop();
+      void this.refreshManifest();
+    }
   }
 
   async identityChanged(): Promise<void> {
-    // A reset creates a new anonymous actor. Pending interactions must not be
-    // delivered under that new identity, or old-user Experiences would be
-    // attributed to the next person using the same browser.
-    await this.clearRuntimeState(true);
-    if (this.canEvaluate()) {
-      try {
-        await this.ensureManifest(true);
-      } catch (error) {
-        this.handleError(error);
-      }
-    }
+    // Identity changes must not deliver an old actor's pending interactions
+    // under the newly bound or newly anonymous actor.
+    await this.clearRuntimeState(true, false);
   }
 
   destroy(): void {
     this.destroyed = true;
+    this.stopRefreshLoop();
     if (this.retryTimer) clearTimeout(this.retryTimer);
     if (this.nextPresentationTimer) clearTimeout(this.nextPresentationTimer);
+    this.retryTimer = undefined;
     this.nextPresentationTimer = undefined;
-    this.renderAbortController?.abort();
-    this.renderAbortController = undefined;
-    this.renderHandle?.dismiss("dismissed", false);
-    this.clearCurrentPresentation();
+    this.abortPresentation();
     this.queue = [];
-    this.manualPresentations.clear();
-    this.manualOfferedHandle = undefined;
-    this.reportedImpressionHandles.clear();
-    this.reportedActionHandles.clear();
+    this.reportedImpressions.clear();
+    this.recordedBranches.clear();
     this.actionHandlers.clear();
-    this.availableHandlers.clear();
   }
 
-  private async ensureManifest(force = false): Promise<ExperienceManifest | undefined> {
-    if (!this.canEvaluate()) return undefined;
-    if (
-      !force &&
-      this.manifest &&
-      Date.now() - this.manifestLoadedAt < MANIFEST_CACHE_MS &&
-      Date.parse(this.manifest.expiresAt) > Date.now()
-    ) {
-      return this.manifest;
+  private async evaluateInBackground(context: ExperienceContext): Promise<void> {
+    try {
+      await this.loadCachedManifest();
+      const current = this.validManifest();
+      if (current) await this.evaluateContextualManifest(current, context);
+
+      const stale = !current || Date.now() - this.manifestLoadedAt >= REFRESH_INTERVAL_MS;
+      if (stale) {
+        const refreshed = await this.refreshManifest();
+        const latest = this.validManifest();
+        if (refreshed && latest) await this.evaluateContextualManifest(latest, context);
+      }
+
+      const manifest = this.validManifest();
+      if (manifest && this.canEvaluate()) {
+        const response = await this.transport.decide({
+          identity: this.requireIdentity(),
+          metadata: this.metadata,
+          testDeviceToken: this.testDeviceToken,
+          candidateVersionIds: manifest.campaigns.map((item) => item.campaignVersionId),
+          context: {
+            ...toRuntimeContext(context),
+            trigger: context.trigger,
+          },
+        });
+        this.decisionMode = response.mode;
+        await this.acceptDecisions(response.decisions, toRuntimeContext(context), manifest);
+      }
+    } catch (error) {
+      this.handleError(error);
     }
-    const response: BootstrapResponse = await this.transport.bootstrap({
-      consent: this.activeConsent,
-      profileConsentGranted: this.dependencies.getProfileConsent(),
+  }
+
+  private async evaluateContextualManifest(
+    manifest: ExperienceManifest,
+    context: ExperienceContext,
+  ): Promise<void> {
+    const runtimeContext = toRuntimeContext(context);
+    const candidates = manifest.campaigns
+      .filter((campaign) => !campaign.requiresPersonalization)
+      .filter((campaign) => isCampaignActive(campaign))
+      .filter((campaign) => triggerMatches(campaign, runtimeContext))
+      .filter((campaign) => targetingMatches(campaign.targeting, manifest, this.metadata.locale))
+      .sort(compareCampaigns)
+      .slice(0, MAX_CANDIDATES);
+    const manifestExpiresAt = Date.parse(manifest.expiresAt);
+    for (const campaign of candidates) {
+      await this.acceptManifestCampaign(campaign, runtimeContext, manifestExpiresAt);
+    }
+  }
+
+  private async loadCachedManifest(): Promise<void> {
+    if (this.cacheLoaded || !this.canEvaluate()) return;
+    this.cacheLoaded = true;
+    const storage = this.dependencies.getStorage();
+    const cached = (await storage?.load())?.experienceManifest;
+    if (!cached) return;
+    try {
+      const manifest = await this.verifyStoredManifest(cached);
+      this.manifest = manifest;
+      this.manifestEtag = cached.etag;
+      this.manifestLoadedAt = Date.parse(cached.cachedAt);
+      if (!Number.isFinite(this.manifestLoadedAt)) this.manifestLoadedAt = 0;
+    } catch (error) {
+      await storage?.saveExperienceManifest();
+      this.handleError(error);
+    }
+  }
+
+  private refreshManifest(): Promise<boolean> {
+    if (!this.canEvaluate()) return Promise.resolve(false);
+    if (this.refreshFlight) return this.refreshFlight;
+    const pending = this.performManifestRefresh();
+    this.refreshFlight = pending;
+    void pending
+      .finally(() => {
+        if (this.refreshFlight === pending) this.refreshFlight = undefined;
+      })
+      .catch(() => undefined);
+    return pending;
+  }
+
+  private async performManifestRefresh(): Promise<boolean> {
+    const response = await this.transport.bootstrap({
       identity: this.requireIdentity(),
       metadata: this.metadata,
-      settings: this.settings,
       testDeviceToken: this.testDeviceToken,
+      ...(this.manifestEtag ? { etag: this.manifestEtag } : {}),
     });
-    if (!response.signedPayload || !response.keyId || !response.signature) {
-      throw new Error("EXPERIENCE_MANIFEST_INVALID");
+    if (response.notModified) {
+      this.manifestLoadedAt = Date.now();
+      if (response.etag) this.manifestEtag = response.etag;
+      return false;
     }
-    const manifest = await verifyExperienceManifestPayload({
-      signedPayload: response.signedPayload,
-      kid: response.keyId,
-      signature: response.signature,
-      manifestVerificationKeys: this.dependencies.options.manifestVerificationKeys,
-      expectedSourceKey: this.dependencies.sourceKey,
-    });
-    const expiresAt = Date.parse(manifest.expiresAt);
-    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
-      throw new Error("EXPERIENCE_MANIFEST_INVALID");
-    }
+    const envelope = response.response;
+    const cached: StoredExperienceManifest = {
+      signedPayload: envelope.signedPayload,
+      signature: envelope.signature,
+      keyId: envelope.keyId,
+      expiresAt: envelope.expiresAt,
+      onlineKeyset: envelope.onlineKeyset,
+      cachedAt: new Date().toISOString(),
+      ...(response.etag ? { etag: response.etag } : {}),
+    };
+    const manifest = await this.verifyStoredManifest(cached);
     this.manifest = manifest;
     this.manifestLoadedAt = Date.now();
+    this.manifestEtag = response.etag;
+    this.cacheLoaded = true;
     this.lastErrorCode = null;
-    return this.manifest;
+    await this.dependencies.getStorage()?.saveExperienceManifest(cached);
+    return true;
+  }
+
+  private verifyStoredManifest(cached: StoredExperienceManifest): Promise<ExperienceManifest> {
+    return verifyExperienceManifestPayload({
+      signedPayload: cached.signedPayload,
+      kid: cached.keyId,
+      signature: cached.signature,
+      onlineKeyset: cached.onlineKeyset,
+      expectedSourceKey: this.dependencies.sourceKey,
+      ...(this.dependencies.rootPublicKey
+        ? { rootPublicKey: this.dependencies.rootPublicKey }
+        : {}),
+    });
+  }
+
+  private validManifest(): ExperienceManifest | undefined {
+    if (!this.manifest) return undefined;
+    if (Date.parse(this.manifest.expiresAt) > Date.now()) return this.manifest;
+    this.manifest = undefined;
+    this.manifestEtag = undefined;
+    void this.dependencies.getStorage()?.saveExperienceManifest();
+    this.lastErrorCode = "EXPERIENCE_MANIFEST_EXPIRED";
+    return undefined;
   }
 
   private async acceptManifestCampaign(
@@ -526,116 +481,99 @@ export class ExperienceRuntime {
     const assignment = campaign.assignment;
     if (!assignment || !campaign.grant) return;
     if (assignment.kind === "holdout") {
-      await this.recordBranch(
-        campaign,
-        assignment.assignmentId,
-        null,
-        campaign.grant,
-        "assigned_holdout",
-        context,
-      );
+      await this.recordBranch(campaign, assignment.assignmentId, null, campaign.grant, context);
       return;
     }
     const variant = campaign.variants.find((item) => item.id === assignment.variantId);
     if (!variant) return;
-    const exposureId = createUuid();
-    await this.enqueueCandidate(
-      {
-        campaignId: campaign.campaignId,
-        campaignVersionId: campaign.campaignVersionId,
-        assignmentId: assignment.assignmentId,
-        variantId: assignment.variantId,
-        // The manual callback exposes only this opaque handle, which maps to
-        // the exposure ID. No grant or exposure data is exposed in content.
-        presentationHandle: exposureId,
-        exposureId,
-        placement: campaign.placement,
-        priority: campaign.priority,
-        content: variant.content,
-        ...(variant.asset?.url ? { assetUrl: variant.asset.url } : {}),
-        grant: campaign.grant,
-        defaultLocale: campaign.defaultLocale,
-        eligibleAt: Date.now(),
-        manifestExpiresAt,
-        ...(context.triggerEventId ? { triggerEventId: context.triggerEventId } : {}),
-      },
-      context,
-    );
+    const assetUrl = variant.asset?.url;
+    await this.enqueueCandidate({
+      campaignId: campaign.campaignId,
+      campaignVersionId: campaign.campaignVersionId,
+      assignmentId: assignment.assignmentId,
+      variantId: assignment.variantId,
+      exposureId: createUuid(),
+      placement: campaign.placement,
+      priority: campaign.priority,
+      content: variant.content,
+      ...(safeAssetUrl(assetUrl) ? { assetUrl } : {}),
+      grant: campaign.grant,
+      defaultLocale: campaign.defaultLocale,
+      eligibleAt: Date.now(),
+      manifestExpiresAt,
+      frequency: campaign.frequency,
+      ...(context.triggerEventId ? { triggerEventId: context.triggerEventId } : {}),
+    });
   }
 
   private async acceptDecisions(
     decisions: ExperienceDecision[],
     context: RuntimeContext,
-    manifestExpiresAt: number,
+    manifest: ExperienceManifest,
   ): Promise<void> {
-    for (const decision of decisions) {
+    for (const decision of decisions.sort(compareDecisions).slice(0, MAX_CANDIDATES)) {
       if (decision.holdout) {
-        await this.recordBranch(
-          {
-            campaignId: decision.campaignId,
-            campaignVersionId: decision.campaignVersionId,
-          },
-          decision.assignmentId,
-          null,
-          decision.grant,
-          "assigned_holdout",
-          context,
-        );
+        await this.recordBranch(decision, decision.assignmentId, null, decision.grant, context);
         continue;
       }
       if (!decision.content) continue;
-      const exposureId = createUuid();
-      await this.enqueueCandidate(
-        {
-          campaignId: decision.campaignId,
-          campaignVersionId: decision.campaignVersionId,
-          assignmentId: decision.assignmentId,
-          variantId: decision.variantId,
-          presentationHandle: exposureId,
-          exposureId,
-          placement: decision.placement,
-          priority: decision.priority,
-          content: decision.content.content,
-          ...(decision.content.asset?.url ? { assetUrl: decision.content.asset.url } : {}),
-          grant: decision.grant,
-          defaultLocale: "en",
-          eligibleAt: Date.now(),
-          manifestExpiresAt,
-          ...(context.triggerEventId ? { triggerEventId: context.triggerEventId } : {}),
-        },
-        context,
-      );
+      const frequency = manifest.campaigns.find(
+        (item) => item.campaignVersionId === decision.campaignVersionId,
+      )?.frequency ?? { session: 1, daily: 1 };
+      const assetUrl = decision.content.asset?.url;
+      await this.enqueueCandidate({
+        campaignId: decision.campaignId,
+        campaignVersionId: decision.campaignVersionId,
+        assignmentId: decision.assignmentId,
+        variantId: decision.variantId,
+        exposureId: createUuid(),
+        placement: decision.placement,
+        priority: decision.priority,
+        content: decision.content.content,
+        ...(safeAssetUrl(assetUrl) ? { assetUrl } : {}),
+        grant: decision.grant,
+        defaultLocale: "en",
+        eligibleAt: Date.now(),
+        manifestExpiresAt: Date.parse(manifest.expiresAt),
+        frequency,
+        ...(context.triggerEventId ? { triggerEventId: context.triggerEventId } : {}),
+      });
     }
   }
 
-  private async enqueueCandidate(candidate: QueuedExperience, context: RuntimeContext) {
-    if (this.isCandidateExpired(candidate)) return;
+  private async enqueueCandidate(candidate: QueuedExperience): Promise<void> {
     if (
-      this.queue.some(
-        (item) =>
-          item.campaignId === candidate.campaignId &&
-          item.campaignVersionId === candidate.campaignVersionId,
-      ) ||
-      (this.current?.campaignId === candidate.campaignId &&
-        this.current.campaignVersionId === candidate.campaignVersionId)
+      this.isCandidateExpired(candidate) ||
+      !isWebPlacement(candidate.placement) ||
+      !(await this.frequencyAllowed(candidate))
+    ) {
+      return;
+    }
+    if (
+      this.queue.some((item) => item.campaignVersionId === candidate.campaignVersionId) ||
+      this.current?.campaignVersionId === candidate.campaignVersionId
     ) {
       return;
     }
     await this.record(candidate, "assigned_variant");
     await this.record(candidate, "eligible");
     this.queue.push(candidate);
-    this.sortQueue();
+    this.queue.sort(compareQueued);
     if (this.queue.length > MAX_CANDIDATES) this.queue.length = MAX_CANDIDATES;
-    if (!this.queue.some((item) => item.presentationHandle === candidate.presentationHandle)) {
-      return;
-    }
+    if (!this.queue.some((item) => item.exposureId === candidate.exposureId)) return;
     await this.record(candidate, "queued");
-    if (this.dependencies.options.renderMode === "manual") {
-      this.rememberManualPresentation(candidate);
-      this.offerNextManualCandidate();
-    }
-    if (this.dependencies.options.renderMode === "automatic") void this.presentNext();
-    void context;
+    void this.presentNext();
+  }
+
+  private async frequencyAllowed(candidate: QueuedExperience): Promise<boolean> {
+    const session = this.sessionCampaignImpressions.get(candidate.campaignVersionId) ?? 0;
+    if (session >= candidate.frequency.session) return false;
+    const ledger = (await this.dependencies.getStorage()?.load())?.experienceImpressions ?? {};
+    const cutoff = Date.now() - 24 * 60 * 60_000;
+    const daily = (ledger[candidate.campaignVersionId] ?? []).filter(
+      (value) => Date.parse(value) > cutoff,
+    ).length;
+    return daily < candidate.frequency.daily;
   }
 
   private async recordBranch(
@@ -643,341 +581,154 @@ export class ExperienceRuntime {
     assignmentId: string,
     variantId: string | null,
     grant: string,
-    type: "assigned_holdout",
     context: RuntimeContext,
-  ) {
-    const interaction = this.createInteraction(
-      {
-        campaignId: campaign.campaignId,
-        campaignVersionId: campaign.campaignVersionId,
-        assignmentId,
-        variantId,
-        exposureId: null,
-        grant,
-        ...(context.triggerEventId ? { triggerEventId: context.triggerEventId } : {}),
-      },
-      type,
+  ): Promise<void> {
+    const key = `${campaign.campaignVersionId}:${context.triggerEventId ?? "no-event"}`;
+    if (this.recordedBranches.has(key)) return;
+    this.recordedBranches.add(key);
+    await this.enqueueInteraction(
+      this.createInteraction(
+        {
+          campaignId: campaign.campaignId,
+          campaignVersionId: campaign.campaignVersionId,
+          assignmentId,
+          variantId,
+          exposureId: null,
+          grant,
+          ...(context.triggerEventId ? { triggerEventId: context.triggerEventId } : {}),
+        },
+        "assigned_holdout",
+      ),
     );
-    await this.enqueueInteraction(interaction);
   }
 
   private async record(
     experience: QueuedExperience,
     type: ExperienceInteraction["type"],
-    details: { actionId?: string; failureCode?: string } = {},
-  ) {
+    details: {
+      actionId?: string;
+      actionOutcome?: "handled" | "unhandled";
+      failureCode?: string;
+    } = {},
+  ): Promise<void> {
     await this.enqueueInteraction(
-      this.createInteraction(experience, type, details.actionId, details.failureCode),
+      this.createInteraction(
+        experience,
+        type,
+        details.actionId,
+        details.actionOutcome,
+        details.failureCode,
+      ),
     );
   }
 
-  private async recordImpression(experience: QueuedExperience) {
+  private async recordImpression(experience: QueuedExperience): Promise<void> {
     if (this.current?.exposureId !== experience.exposureId) return;
-    if (this.reportedImpressionHandles.has(experience.presentationHandle)) return;
-    this.reportedImpressionHandles.add(experience.presentationHandle);
+    if (this.reportedImpressions.has(experience.exposureId)) return;
+    this.reportedImpressions.add(experience.exposureId);
     this.sessionImpressions += 1;
+    this.sessionCampaignImpressions.set(
+      experience.campaignVersionId,
+      (this.sessionCampaignImpressions.get(experience.campaignVersionId) ?? 0) + 1,
+    );
+    const occurredAt = new Date().toISOString();
+    await this.dependencies
+      .getStorage()
+      ?.recordExperienceImpression(experience.campaignVersionId, occurredAt);
     await this.record(experience, "impression");
   }
 
-  private async finish(experience: QueuedExperience, reason: "dismissed" | "auto_closed") {
+  private async finish(
+    experience: QueuedExperience,
+    reason: "dismissed" | "auto_closed",
+  ): Promise<void> {
     if (this.suppressInteractionCallbacks) return;
     if (this.current?.exposureId !== experience.exposureId) return;
     await this.record(experience, reason);
     this.clearCurrentPresentation();
-    this.cooldownUntil = Date.now() + 3_000;
+    this.cooldownUntil = Date.now() + PRESENTATION_COOLDOWN_MS;
     this.scheduleNextPresentation();
   }
 
-  private async handleAction(experience: QueuedExperience, action: ExperienceAction) {
-    if (!this.isActionAllowed(action)) {
-      this.lastErrorCode = "EXPERIENCE_ACTION_NOT_ALLOWED";
-      return;
-    }
+  private async handleAction(
+    experience: QueuedExperience,
+    action: ExperienceAction,
+  ): Promise<void> {
+    if (this.current?.exposureId !== experience.exposureId) return;
     let handled = false;
-    for (const handler of this.actionHandlers) {
-      try {
-        handled =
-          (await handler({ experience: toPublicExperience(experience), action, handled })) ===
-            true || handled;
-      } catch (error) {
-        this.handleError(error);
+    if (isSafeAction(action)) {
+      for (const handler of this.actionHandlers) {
+        try {
+          if ((await handler({ experience: toPublicExperience(experience), action })) === true) {
+            handled = true;
+          }
+        } catch (error) {
+          this.handleError(error);
+        }
       }
+      if (!handled) handled = await this.performDefaultAction(action);
+    } else {
+      this.lastErrorCode = "EXPERIENCE_ACTION_NOT_ALLOWED";
     }
-    if (!handled && action.type === "CUSTOM_CALLBACK") {
-      // A callback target is an opaque host-app contract. An allowlist alone
-      // must never make the SDK claim it ran a callback: retain the surface so
-      // the host can register a handler or let the user dismiss it.
-      this.lastErrorCode = "EXPERIENCE_CALLBACK_UNHANDLED";
-      return;
-    }
-    if (!handled) handled = await this.performSafeDefaultAction(action);
     const content = selectLocalizedContent(experience.content.translations, this.metadata.locale);
     await this.record(
       experience,
       content?.primaryAction?.id === action.id ? "primary_action" : "secondary_action",
-      { actionId: action.id },
+      { actionId: action.id, actionOutcome: handled ? "handled" : "unhandled" },
     );
-    if (handled || action.type === "DISMISS") {
-      this.renderHandle?.dismiss("dismissed");
-      if (["OPEN_INTERNAL_ROUTE", "OPEN_DEEP_LINK", "OPEN_WEB_URL"].includes(action.type)) {
-        this.queue = [];
-      }
-    }
+    // An unhandled advanced action deliberately leaves the Experience open.
+    if (handled) this.renderHandle?.dismiss("dismissed");
   }
 
-  private async performSafeDefaultAction(action: ExperienceAction): Promise<boolean> {
+  private async handleTestAction(
+    experience: QueuedExperience,
+    action: ExperienceAction,
+    onInteraction: (interaction: "impression" | "action") => void,
+  ): Promise<void> {
+    let handled = false;
+    if (isSafeAction(action)) {
+      for (const handler of this.actionHandlers) {
+        try {
+          if ((await handler({ experience: toPublicExperience(experience), action })) === true) {
+            handled = true;
+          }
+        } catch (error) {
+          this.handleError(error);
+        }
+      }
+      if (!handled) handled = await this.performDefaultAction(action);
+    }
+    onInteraction("action");
+    if (handled) this.testRenderHandle?.dismiss("dismissed");
+  }
+
+  private async performDefaultAction(action: ExperienceAction): Promise<boolean> {
     const target = action.target;
     switch (action.type) {
       case "DISMISS":
         return true;
       case "COPY_CODE":
-        if (!target || !navigator.clipboard) return false;
-        await navigator.clipboard.writeText(target);
+        if (!target || !globalThis.navigator?.clipboard) return false;
+        await globalThis.navigator.clipboard.writeText(target);
         return true;
       case "OPEN_INTERNAL_ROUTE":
-        if (!target || !this.dependencies.options.allowedInternalRoutes.includes(target))
-          return false;
-        history.pushState(history.state, "", target);
-        window.dispatchEvent(new PopStateEvent("popstate"));
-        return true;
       case "CUSTOM_CALLBACK":
         return false;
       case "OPEN_WEB_URL":
-        if (!target) return false;
-        return this.openWebUrl(target);
       case "OPEN_DEEP_LINK":
-        if (!target) return false;
-        return this.openDeepLink(target);
-    }
-  }
-
-  private isActionAllowed(action: ExperienceAction): boolean {
-    const target = action.target;
-    switch (action.type) {
-      case "DISMISS":
+        if (!target || typeof window === "undefined") return false;
+        window.location.assign(new URL(target).href);
         return true;
-      case "COPY_CODE":
-        return Boolean(target);
-      case "OPEN_INTERNAL_ROUTE":
-        return Boolean(target && this.dependencies.options.allowedInternalRoutes.includes(target));
-      case "CUSTOM_CALLBACK":
-        return Boolean(target && this.dependencies.options.allowedCallbackKeys.includes(target));
-      case "OPEN_WEB_URL":
-        if (!target) return false;
-        try {
-          const parsed = new URL(target);
-          return (
-            parsed.protocol === "https:" &&
-            this.dependencies.options.allowedWebOrigins.includes(parsed.origin.toLowerCase())
-          );
-        } catch {
-          return false;
-        }
-      case "OPEN_DEEP_LINK":
-        if (!target) return false;
-        try {
-          const parsed = new URL(target);
-          const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
-          if (parsed.protocol !== "https:" && isUnsafeDeepLinkScheme(scheme)) return false;
-          return parsed.protocol === "https:"
-            ? this.isAllowedHttpsDeepLink(parsed)
-            : this.dependencies.options.allowedDeepLinkSchemes.includes(scheme);
-        } catch {
-          return false;
-        }
     }
   }
 
-  private openWebUrl(target: string) {
-    try {
-      const parsed = new URL(target);
-      if (
-        parsed.protocol !== "https:" ||
-        !this.dependencies.options.allowedWebOrigins.includes(parsed.origin.toLowerCase())
-      ) {
-        return false;
-      }
-      window.location.assign(parsed.href);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private openDeepLink(target: string) {
-    try {
-      const parsed = new URL(target);
-      const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
-      if (parsed.protocol !== "https:" && isUnsafeDeepLinkScheme(scheme)) return false;
-      const allowed =
-        parsed.protocol === "https:"
-          ? this.isAllowedHttpsDeepLink(parsed)
-          : this.dependencies.options.allowedDeepLinkSchemes.includes(scheme);
-      if (!allowed) return false;
-      window.location.assign(parsed.href);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private isAllowedHttpsDeepLink(target: URL): boolean {
-    return (
-      !target.username &&
-      !target.password &&
-      !target.port &&
-      this.dependencies.options.allowedDeepLinkHosts.includes(target.hostname.toLowerCase())
-    );
-  }
-
-  private manualPresentationUnavailable(): ExperiencePresentationResult | undefined {
-    if (this.destroyed) return this.presentationRejected("destroyed");
-    if (!this.dependencies.options.enabled) return this.presentationRejected("feature_disabled");
-    if (this.dependencies.options.renderMode !== "manual") {
-      return this.presentationRejected("manual_mode_required");
-    }
-    if (!this.canEvaluate()) return this.presentationRejected("consent_required");
-    return undefined;
-  }
-
-  private activeManualPresentation(handle: string): QueuedExperience | undefined {
-    const state = this.manualPresentations.get(handle);
-    if (!state?.rendered || state.dismissed) return undefined;
-    return this.current?.presentationHandle === handle ? this.current : undefined;
-  }
-
-  private rememberManualPresentation(candidate: QueuedExperience): void {
-    this.manualPresentations.set(candidate.presentationHandle, {
-      rendered: false,
-      impressionRecorded: false,
-      dismissed: false,
-      actions: new Set<string>(),
-    });
-    while (this.manualPresentations.size > MAX_MANUAL_PRESENTATION_HISTORY) {
-      const oldest = this.manualPresentations.keys().next().value;
-      if (!oldest) break;
-      this.manualPresentations.delete(oldest);
-    }
-  }
-
-  private offerNextManualCandidate(): void {
-    this.discardExpiredCandidates();
-    if (
-      this.destroyed ||
-      this.dependencies.options.renderMode !== "manual" ||
-      !this.canEvaluate() ||
-      this.current ||
-      Date.now() < this.cooldownUntil ||
-      this.availableHandlers.size === 0
-    ) {
-      return;
-    }
-    this.discardOverCapOverlayCandidates();
-    const candidate = this.queue[0];
-    if (!candidate || this.manualOfferedHandle === candidate.presentationHandle) return;
-    const state = this.manualPresentations.get(candidate.presentationHandle);
-    if (!state || state.dismissed) return;
-    this.manualOfferedHandle = candidate.presentationHandle;
-    const presentation: WtsExperienceManualPresentation = {
-      experience: toPublicExperience(candidate),
-      handle: candidate.presentationHandle,
-    };
-    for (const handler of this.availableHandlers) {
-      this.notifyAvailableHandler(handler, presentation);
-    }
-  }
-
-  private notifyAvailableHandler(
-    handler: ExperienceAvailableHandler,
-    presentation: WtsExperienceManualPresentation,
-  ): void {
-    try {
-      void Promise.resolve(handler(presentation)).catch(() => this.handleManualHandlerError());
-    } catch {
-      this.handleManualHandlerError();
-    }
-  }
-
-  private scheduleNextPresentation(): void {
-    if (this.nextPresentationTimer) clearTimeout(this.nextPresentationTimer);
-    this.nextPresentationTimer = setTimeout(() => {
-      this.nextPresentationTimer = undefined;
-      if (this.dependencies.options.renderMode === "automatic") {
-        void this.presentNext();
-      } else {
-        this.offerNextManualCandidate();
-      }
-    }, 3_000);
-  }
-
-  private canAdmitOverlay(candidate: QueuedExperience): boolean {
-    return !isOverlayPlacement(candidate.placement) || this.sessionOverlays < MAX_SESSION_OVERLAYS;
-  }
-
-  private admitOverlay(candidate: QueuedExperience): void {
-    if (isOverlayPlacement(candidate.placement)) this.sessionOverlays += 1;
-  }
-
-  private discardOverCapOverlayCandidates(): void {
-    while (this.queue[0] && !this.canAdmitOverlay(this.queue[0])) {
-      const candidate = this.queue.shift()!;
-      const state = this.manualPresentations.get(candidate.presentationHandle);
-      if (state) state.dismissed = true;
-      if (this.manualOfferedHandle === candidate.presentationHandle) {
-        this.manualOfferedHandle = undefined;
-      }
-    }
-  }
-
-  private discardExpiredCandidates(): Set<string> {
-    const expiredHandles = new Set<string>();
+  private discardExpiredCandidates(): void {
     const now = Date.now();
-    this.queue = this.queue.filter((candidate) => {
-      if (!this.isCandidateExpired(candidate, now)) return true;
-      expiredHandles.add(candidate.presentationHandle);
-      const state = this.manualPresentations.get(candidate.presentationHandle);
-      if (state) state.dismissed = true;
-      if (this.manualOfferedHandle === candidate.presentationHandle) {
-        this.manualOfferedHandle = undefined;
-      }
-      return false;
-    });
-    return expiredHandles;
+    this.queue = this.queue.filter((candidate) => !this.isCandidateExpired(candidate, now));
   }
 
   private isCandidateExpired(candidate: QueuedExperience, now = Date.now()): boolean {
     return !Number.isFinite(candidate.manifestExpiresAt) || candidate.manifestExpiresAt <= now;
-  }
-
-  private sortQueue(): void {
-    this.queue.sort(compareQueued);
-    if (!this.manualOfferedHandle) return;
-    const offeredIndex = this.queue.findIndex(
-      (item) => item.presentationHandle === this.manualOfferedHandle,
-    );
-    if (offeredIndex < 0) {
-      this.manualOfferedHandle = undefined;
-      return;
-    }
-    if (offeredIndex > 0) {
-      const [offered] = this.queue.splice(offeredIndex, 1);
-      if (offered) this.queue.unshift(offered);
-    }
-  }
-
-  private presentationAccepted(idempotent: boolean): ExperiencePresentationResult {
-    return { accepted: true, idempotent };
-  }
-
-  private presentationRejected(
-    code: NonNullable<ExperiencePresentationResult["code"]>,
-  ): ExperiencePresentationResult {
-    return { accepted: false, idempotent: false, code };
-  }
-
-  private clearCurrentPresentation() {
-    this.current = undefined;
-    this.renderHandle = undefined;
   }
 
   private createInteraction(
@@ -992,6 +743,7 @@ export class ExperienceRuntime {
     },
     type: ExperienceInteraction["type"],
     actionId?: string,
+    actionOutcome?: "handled" | "unhandled",
     failureCode?: string,
   ): ExperienceInteraction {
     return {
@@ -1004,6 +756,7 @@ export class ExperienceRuntime {
       exposureId: experience.exposureId,
       type,
       actionId: actionId ?? null,
+      actionOutcome: actionOutcome ?? null,
       triggerEventId: experience.triggerEventId ?? null,
       occurredAt: new Date().toISOString(),
       metadata: this.metadata,
@@ -1011,31 +764,31 @@ export class ExperienceRuntime {
     };
   }
 
-  private async enqueueInteraction(interaction: ExperienceInteraction) {
+  private async enqueueInteraction(interaction: ExperienceInteraction): Promise<void> {
     const storage = this.dependencies.getStorage();
-    if (!storage) return;
+    if (!storage || !this.canEvaluate()) return;
     await storage.enqueueExperience(interaction);
     this.dependencies.onInteraction?.(interaction.type);
     queueMicrotask(() => void this.flushInteractions());
   }
 
-  private async clearRuntimeState(clearStored: boolean) {
+  private async clearRuntimeState(clearStored: boolean, clearManifest: boolean): Promise<void> {
     if (this.retryTimer) clearTimeout(this.retryTimer);
-    this.retryTimer = undefined;
     if (this.nextPresentationTimer) clearTimeout(this.nextPresentationTimer);
+    this.retryTimer = undefined;
     this.nextPresentationTimer = undefined;
     this.suppressInteractionCallbacks = true;
-    this.renderAbortController?.abort();
-    this.renderAbortController = undefined;
-    this.renderHandle?.dismiss("dismissed", false);
-    this.clearCurrentPresentation();
+    this.abortPresentation();
     this.queue = [];
-    this.manualPresentations.clear();
-    this.manualOfferedHandle = undefined;
-    this.reportedImpressionHandles.clear();
-    this.reportedActionHandles.clear();
-    this.manifest = undefined;
-    this.manifestLoadedAt = 0;
+    this.reportedImpressions.clear();
+    this.recordedBranches.clear();
+    this.decisionMode = null;
+    if (clearManifest) {
+      this.manifest = undefined;
+      this.manifestEtag = undefined;
+      this.manifestLoadedAt = 0;
+      this.cacheLoaded = false;
+    }
     try {
       if (clearStored) {
         const storage = this.dependencies.getStorage();
@@ -1044,6 +797,7 @@ export class ExperienceRuntime {
           await storage?.removeExperiences(
             new Set(state.experienceQueue.map((item) => item.clientInteractionId)),
           );
+          if (clearManifest) await storage?.saveExperienceManifest();
         }
       }
     } finally {
@@ -1051,7 +805,29 @@ export class ExperienceRuntime {
     }
   }
 
-  private scheduleRetry() {
+  private startRefreshLoop(): void {
+    if (this.refreshTimer || typeof document === "undefined") return;
+    this.refreshTimer = setInterval(() => {
+      if (document.visibilityState === "visible" && this.canEvaluate()) {
+        void this.refreshManifest().catch((error) => this.handleError(error));
+      }
+    }, REFRESH_INTERVAL_MS);
+  }
+
+  private stopRefreshLoop(): void {
+    if (this.refreshTimer) clearInterval(this.refreshTimer);
+    this.refreshTimer = undefined;
+  }
+
+  private scheduleNextPresentation(): void {
+    if (this.nextPresentationTimer) clearTimeout(this.nextPresentationTimer);
+    this.nextPresentationTimer = setTimeout(() => {
+      this.nextPresentationTimer = undefined;
+      void this.presentNext();
+    }, PRESENTATION_COOLDOWN_MS);
+  }
+
+  private scheduleRetry(): void {
     if (this.retryTimer || !this.canEvaluate()) return;
     const base = Math.min(60_000, 1_000 * 2 ** Math.min(this.retryAttempt, 6));
     this.retryAttempt += 1;
@@ -1060,28 +836,36 @@ export class ExperienceRuntime {
         this.retryTimer = undefined;
         void this.flushInteractions();
       },
-      base + Math.floor(Math.random() * base * 0.25),
+      base + Math.floor(Math.random() * Math.max(1, base * 0.25)),
     );
   }
 
-  private handleError(error: unknown) {
-    this.lastErrorCode = normalizeErrorCode(error);
-    safeWarn(this.dependencies.debug, `Experiences request failed (${this.lastErrorCode}).`);
+  private abortPresentation(): void {
+    this.renderAbortController?.abort();
+    this.renderAbortController = undefined;
+    this.renderHandle?.dismiss("dismissed", false);
+    this.testRenderAbortController?.abort();
+    this.testRenderAbortController = undefined;
+    this.testRenderHandle?.dismiss("dismissed", false);
+    this.testRenderHandle = undefined;
+    this.clearCurrentPresentation();
   }
 
-  private handleManualHandlerError(): void {
-    this.lastErrorCode = "EXPERIENCE_MANUAL_HANDLER_FAILED";
-    safeWarn(this.dependencies.debug, "Experience manual presentation handler failed.");
+  private clearCurrentPresentation(): void {
+    this.current = undefined;
+    this.renderHandle = undefined;
+  }
+
+  private handleError(error: unknown): void {
+    this.lastErrorCode = normalizeErrorCode(error);
+    safeWarn(this.dependencies.debug, `Experiences request failed (${this.lastErrorCode}).`);
   }
 
   private canEvaluate(): boolean {
     return (
       !this.destroyed &&
-      this.dependencies.options.enabled &&
-      this.dependencies.getAnalyticsConsent() === "granted" &&
-      (this.consent === "contextual" || this.consent === "personalized") &&
-      (this.consent !== "personalized" || this.dependencies.getProfileConsent()) &&
-      (this.consent !== "personalized" || this.dependencies.getProfileIdentityReady()) &&
+      this.consent === "granted" &&
+      this.dependencies.getConsent() === "granted" &&
       Boolean(this.dependencies.getIdentity()) &&
       Boolean(this.dependencies.getStorage())
     );
@@ -1093,27 +877,19 @@ export class ExperienceRuntime {
     return identity;
   }
 
-  private get activeConsent(): "contextual" | "personalized" {
-    if (this.consent !== "contextual" && this.consent !== "personalized") {
-      throw new Error("EXPERIENCE_CONSENT_REQUIRED");
-    }
-    return this.consent;
-  }
-
   private get metadata() {
     return { platform: "web" as const, sdkVersion: SDK_VERSION, locale: locale() };
   }
+}
 
-  private get settings() {
-    const options = this.dependencies.options;
-    return {
-      allowedInternalRoutes: options.allowedInternalRoutes,
-      allowedCallbackKeys: options.allowedCallbackKeys,
-      allowedDeepLinkHosts: options.allowedDeepLinkHosts,
-      allowedDeepLinkSchemes: options.allowedDeepLinkSchemes,
-      allowedWebOrigins: options.allowedWebOrigins,
-    };
-  }
+function toRuntimeContext(context: ExperienceContext): RuntimeContext {
+  return {
+    ...(context.pathname ? { pathname: context.pathname } : {}),
+    ...(context.pageName ? { pageName: context.pageName } : {}),
+    ...(context.eventKey ? { eventKey: context.eventKey } : {}),
+    properties: context.properties,
+    ...(context.triggerEventId ? { triggerEventId: context.triggerEventId } : {}),
+  };
 }
 
 function toPublicExperience(candidate: QueuedExperience): WtsExperience {
@@ -1138,14 +914,6 @@ function selectLocalizedContent(
     translations[requestedLocale.split("-")[0] ?? ""] ??
     Object.values(translations)[0]
   );
-}
-
-function findExperienceAction(experience: QueuedExperience, actionId: string) {
-  for (const content of Object.values(experience.content.translations)) {
-    if (content.primaryAction?.id === actionId) return { primary: true };
-    if (content.secondaryAction?.id === actionId) return { primary: false };
-  }
-  return undefined;
 }
 
 function triggerMatches(campaign: ManifestCampaign, context: RuntimeContext): boolean {
@@ -1203,15 +971,23 @@ function compare(current: unknown, operator: string, expected: unknown): boolean
   return operator === "lte" && current <= expected;
 }
 
-function compareCampaigns(left: ManifestCampaign, right: ManifestCampaign) {
+function isCampaignActive(campaign: ManifestCampaign): boolean {
+  const now = Date.now();
+  return (
+    (!campaign.startsAt || Date.parse(campaign.startsAt) <= now) &&
+    (!campaign.endsAt || Date.parse(campaign.endsAt) > now)
+  );
+}
+
+function compareCampaigns(left: ManifestCampaign, right: ManifestCampaign): number {
   return right.priority - left.priority || left.campaignId.localeCompare(right.campaignId);
 }
 
-function isOverlayPlacement(placement: QueuedExperience["placement"]): boolean {
-  return placement === "modal" || placement === "slide_in" || placement === "bottom_sheet";
+function compareDecisions(left: ExperienceDecision, right: ExperienceDecision): number {
+  return right.priority - left.priority || left.campaignId.localeCompare(right.campaignId);
 }
 
-function compareQueued(left: QueuedExperience, right: QueuedExperience) {
+function compareQueued(left: QueuedExperience, right: QueuedExperience): number {
   return (
     right.priority - left.priority ||
     left.eligibleAt - right.eligibleAt ||
@@ -1219,10 +995,66 @@ function compareQueued(left: QueuedExperience, right: QueuedExperience) {
   );
 }
 
-function takeInteractionBatch(queue: ExperienceInteraction[]) {
+function isWebPlacement(placement: QueuedExperience["placement"]): boolean {
+  return ["modal", "top_banner", "bottom_banner", "slide_in"].includes(placement);
+}
+
+function isWebPlacementValue(value: string): value is QueuedExperience["placement"] {
+  return ["modal", "top_banner", "bottom_banner", "slide_in"].includes(value);
+}
+
+function isExperienceContent(value: unknown): value is ExperienceContent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const content = value as Partial<ExperienceContent>;
+  return (
+    Boolean(content.translations) &&
+    typeof content.translations === "object" &&
+    typeof content.closeable === "boolean" &&
+    ["light", "dark", "brand"].includes(String(content.themePreset)) &&
+    typeof content.delaySeconds === "number" &&
+    (content.autoCloseSeconds === null || typeof content.autoCloseSeconds === "number")
+  );
+}
+
+function isOverlayPlacement(placement: QueuedExperience["placement"]): boolean {
+  return placement === "modal" || placement === "slide_in";
+}
+
+function safeAssetUrl(value: string | null | undefined): value is string {
+  if (!value) return false;
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function isSafeAction(action: ExperienceAction): boolean {
+  const target = action.target;
+  if (action.type === "DISMISS") return true;
+  if (action.type === "COPY_CODE") return Boolean(target);
+  if (action.type === "OPEN_INTERNAL_ROUTE" || action.type === "CUSTOM_CALLBACK") {
+    return Boolean(target);
+  }
+  if (!target) return false;
+  try {
+    const parsed = new URL(target);
+    if (parsed.username || parsed.password) return false;
+    if (action.type === "OPEN_WEB_URL") return parsed.protocol === "https:";
+    const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
+    return (
+      parsed.protocol === "https:" ||
+      (/^[a-z][a-z0-9+.-]*$/.test(scheme) && !isUnsafeDeepLinkScheme(scheme))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function takeInteractionBatch(queue: ExperienceInteraction[]): ExperienceInteraction[] {
   const batch: ExperienceInteraction[] = [];
   for (const interaction of queue.slice(0, MAX_BATCH_EVENTS)) {
-    if (byteLength({ schemaVersion: 1, interactions: [...batch, interaction] }) > MAX_BATCH_BYTES) {
+    if (byteLength({ schemaVersion: 2, interactions: [...batch, interaction] }) > MAX_BATCH_BYTES) {
       break;
     }
     batch.push(interaction);
@@ -1238,8 +1070,4 @@ function normalizeErrorCode(error: unknown): string {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
-}
-
-function isValidFailureCode(value: string): boolean {
-  return /^[A-Z][A-Z0-9_]{0,63}$/.test(value);
 }

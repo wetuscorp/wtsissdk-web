@@ -13,14 +13,21 @@
       }
     },
     "scalar": {
-      "oneOf": [{ "type": "string", "maxLength": 512 }, { "type": "number" }, { "type": "boolean" }]
+      "oneOf": [
+        { "type": "string", "maxLength": 512 },
+        { "type": "number" },
+        { "type": "boolean" }
+      ]
     },
     "revenue": {
       "type": "object",
       "additionalProperties": false,
       "required": ["amount", "currency"],
       "properties": {
-        "amount": { "type": "string", "pattern": "^-?\\d{1,12}(?:\\.\\d{1,6})?$" },
+        "amount": {
+          "type": "string",
+          "pattern": "^-?\\d{1,12}(?:\\.\\d{1,6})?$"
+        },
         "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
       }
     }

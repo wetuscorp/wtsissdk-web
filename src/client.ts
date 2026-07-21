@@ -1,10 +1,12 @@
 import { ATTRIBUTION_QUERY_KEY, MAX_BATCH_BYTES, MAX_BATCH_EVENTS, SDK_VERSION } from "./constants";
+import { loadConsentState, persistConsentState } from "./consent";
 import { ExperienceFacade } from "./experiences/facade";
 import type { ExperienceRuntimeDependencies } from "./experiences/runtime";
 import { MultiTabLock } from "./multitab-lock";
 import {
   byteLength,
   clearBrowserSession,
+  clearLegacyBrowserSession,
   createUuid,
   loadBrowserSession,
   locale,
@@ -13,20 +15,15 @@ import {
   saveBrowserSession,
 } from "./runtime";
 import { installSpaTracker } from "./spa-tracker";
-import { createStorage, deleteStorage, MemoryStorage } from "./storage";
+import { createStorage, deleteLegacyStorage, deleteStorage, MemoryStorage } from "./storage";
 import { loadTestSessionRuntime } from "@wts/test-session-loader";
-import { hasPersistedTestSession } from "./test-session-presence";
+import { clearPersistedTestSession, hasPersistedTestSession } from "./test-session-presence";
 import { HttpTransport, TransportError } from "./transport";
 import type {
   ConsentState,
   EventProperties,
   ExperienceActionHandler,
-  ExperienceAvailableHandler,
-  ExperienceConsentResult,
-  ExperienceConsentState,
   ExperienceDiagnostics,
-  ExperienceDismissal,
-  ExperiencePresentationResult,
   FlushResult,
   Identity,
   IdentityBatchResponse,
@@ -65,9 +62,6 @@ const ATTRIBUTION_CONTEXT_TTL_MS = 7 * 24 * 60 * 60_000;
 
 export class WtsClientImpl implements WtsClient {
   private consent: ConsentState;
-  private profileConsentGranted = false;
-  /** Set only after the collector accepted an identify mutation in this runtime. */
-  private profileIdentityReady = false;
   private storage: StorageAdapter | undefined;
   private identity: Identity | undefined;
   private attributionContextId: string | undefined;
@@ -95,7 +89,7 @@ export class WtsClientImpl implements WtsClient {
     testSessionTransport?: TestSessionTransport,
   ) {
     this.options = validateOptions(options);
-    this.consent = this.options.consent;
+    this.consent = loadConsentState(this.options.sourceKey);
     this.transport =
       transport ?? new HttpTransport(this.options.collectorOrigin, this.options.requestTimeoutMs);
     this.lock = new MultiTabLock(`flush-${this.options.sourceKey}`);
@@ -104,13 +98,9 @@ export class WtsClientImpl implements WtsClient {
       collectorOrigin: this.options.collectorOrigin,
       timeoutMs: this.options.requestTimeoutMs,
       debug: this.options.debug,
-      options: this.options.experiences,
-      getAnalyticsConsent: () => this.consent,
-      getProfileConsent: () => this.profileConsentGranted,
-      getProfileIdentityReady: () => this.profileIdentityReady,
+      getConsent: () => this.consent,
       getIdentity: () => this.identity,
       getStorage: () => this.storage,
-      flushIdentity: async () => this.lock.run(async () => this.flushExclusive(false)),
       onInteraction: (type) =>
         this.observeTestSession((session) => {
           session.observeExperienceInteraction(type);
@@ -122,13 +112,15 @@ export class WtsClientImpl implements WtsClient {
       collectorOrigin: this.options.collectorOrigin,
       timeoutMs: this.options.requestTimeoutMs,
       debug: this.options.debug,
-      getAnalyticsConsent: () => this.consent,
-      getProfileConsent: () => this.profileConsentGranted,
-      getExperienceConsent: () => this.experiences.diagnostics().consent,
-      experiencesEnabled: () => this.options.experiences.enabled,
+      getConsent: () => this.consent,
+      experiencesEnabled: () => true,
+      presentTestExperience: (decision, onInteraction) =>
+        this.experiences.presentTestExperience(decision, onInteraction),
       ...(testSessionTransport ? { transport: testSessionTransport } : {}),
     };
-    this.attributionToken = captureAttributionToken();
+    clearLegacyBrowserSession(this.options.sourceKey);
+    void deleteLegacyStorage(this.options.sourceKey).catch(() => undefined);
+    if (this.consent === "granted") this.attributionToken = captureAttributionToken();
     this.installLifecycleListeners();
     if (this.consent === "granted") {
       this.resumePersistedTestSession();
@@ -139,6 +131,7 @@ export class WtsClientImpl implements WtsClient {
 
   async setConsent(consent: "granted" | "denied"): Promise<void> {
     if (this.destroyed) return;
+    persistConsentState(this.options.sourceKey, consent);
     if (consent === "denied") {
       this.consent = "denied";
       this.cancelRetry();
@@ -156,13 +149,13 @@ export class WtsClientImpl implements WtsClient {
       }
       this.storage = undefined;
       this.identity = undefined;
-      this.profileConsentGranted = false;
-      this.profileIdentityReady = false;
       this.attributionContextId = undefined;
       this.attributionContextExpiresAt = undefined;
       this.attributionToken = undefined;
       this.bootstrapped = false;
       clearBrowserSession(this.options.sourceKey);
+      clearPersistedTestSession(this.options.sourceKey);
+      this.testSession?.clear();
       this.removeSpaTracking();
       await this.experiences.setConsent("denied");
       this.observeTestSession((session) => session.observeConsent());
@@ -170,9 +163,14 @@ export class WtsClientImpl implements WtsClient {
     }
     const wasGranted = this.consent === "granted";
     this.consent = "granted";
+    this.attributionToken ??= captureAttributionToken();
     this.resumePersistedTestSession();
     if (!wasGranted || !this.storage) await this.startEnable();
     this.observeTestSession((session) => session.observeConsent());
+  }
+
+  getConsentState(): ConsentState {
+    return this.consent;
   }
 
   async page(name?: string): Promise<OperationResult> {
@@ -192,21 +190,16 @@ export class WtsClientImpl implements WtsClient {
     };
     await this.enqueue(event);
     this.lastPagePath = pathname;
-    await this.experiences.evaluate({
-      trigger: { type: "page_view", match: { kind: "pathname_exact", value: pathname } },
-      pathname,
-      ...(event.pageName ? { pageName: event.pageName } : {}),
-      properties: {},
-      triggerEventId: event.clientEventId,
-    });
+    queueMicrotask(() =>
+      this.experiences.evaluate({
+        trigger: { type: "page_view", match: { kind: "pathname_exact", value: pathname } },
+        pathname,
+        ...(event.pageName ? { pageName: event.pageName } : {}),
+        properties: {},
+        triggerEventId: event.clientEventId,
+      }),
+    );
     return { accepted: true, clientEventId: event.clientEventId };
-  }
-
-  async setProfileConsent(granted: boolean): Promise<void> {
-    if (this.destroyed) return;
-    this.profileConsentGranted = granted;
-    if (!granted) await this.experiences.profileConsentChanged();
-    this.observeTestSession((session) => session.observeProfileConsent());
   }
 
   async track(
@@ -228,12 +221,14 @@ export class WtsClientImpl implements WtsClient {
     };
     await this.enqueue(event);
     this.observeTestSession((session) => session.observeEvent(eventKey, properties, revenue));
-    await this.experiences.evaluate({
-      trigger: { type: "custom_event", eventKey, conditions: [] },
-      eventKey,
-      properties,
-      triggerEventId: event.clientEventId,
-    });
+    queueMicrotask(() =>
+      this.experiences.evaluate({
+        trigger: { type: "custom_event", eventKey, conditions: [] },
+        eventKey,
+        properties,
+        triggerEventId: event.clientEventId,
+      }),
+    );
     return { accepted: true, clientEventId: event.clientEventId };
   }
 
@@ -280,7 +275,6 @@ export class WtsClientImpl implements WtsClient {
     const result = await this.enqueueIdentityMutation({ type: "reset_identity" });
     if (!this.storage) return result;
     this.identity = { anonymousId: createUuid(), sessionId: createUuid() };
-    this.profileIdentityReady = false;
     this.bootstrapClientEventId = createUuid();
     this.attributionContextId = undefined;
     this.attributionContextExpiresAt = undefined;
@@ -298,49 +292,8 @@ export class WtsClientImpl implements WtsClient {
     return result;
   }
 
-  async setExperienceConsent(consent: ExperienceConsentState): Promise<ExperienceConsentResult> {
-    const result = await this.experiences.setConsent(consent);
-    this.observeTestSession((session) => session.observeExperienceConsent());
-    return result;
-  }
-
   onExperienceAction(handler: ExperienceActionHandler): () => void {
     return this.experiences.onAction(handler);
-  }
-
-  onExperienceAvailable(handler: ExperienceAvailableHandler): () => void {
-    return this.experiences.onAvailable(handler);
-  }
-
-  acknowledgeExperienceRender(handle: string): Promise<ExperiencePresentationResult> {
-    return this.experiences.acknowledgeExperienceRender(handle);
-  }
-
-  acknowledgeExperienceImpression(handle: string): Promise<ExperiencePresentationResult> {
-    return this.experiences.acknowledgeExperienceImpression(handle);
-  }
-
-  reportExperienceAction(handle: string, actionId: string): Promise<ExperiencePresentationResult> {
-    return this.experiences.reportExperienceAction(handle, actionId);
-  }
-
-  dismissExperience(
-    handle: string,
-    outcome?: ExperienceDismissal,
-  ): Promise<ExperiencePresentationResult> {
-    return this.experiences.dismissExperience(handle, outcome);
-  }
-
-  /** @deprecated Use dismissExperience(handle, { failureCode }) instead. */
-  failExperiencePresentation(
-    handle: string,
-    failureCode: string,
-  ): Promise<ExperiencePresentationResult> {
-    return this.experiences.failExperiencePresentation(handle, failureCode);
-  }
-
-  presentNextExperience(): Promise<boolean> {
-    return this.experiences.presentNext();
   }
 
   dismissCurrentExperience(): Promise<boolean> {
@@ -352,28 +305,48 @@ export class WtsClientImpl implements WtsClient {
   }
 
   async joinTestSession(pairing: TestSessionPairing): Promise<TestSessionJoinResult> {
+    if (this.consent !== "granted" || this.destroyed) {
+      return {
+        accepted: false,
+        joined: false,
+        compatible: false,
+        checks: [],
+        errorCode: this.destroyed ? "SDK_DESTROYED" : "CONSENT_REQUIRED",
+      };
+    }
     return (await this.ensureTestSession()).join(pairing);
   }
 
   async leaveTestSession(): Promise<{ accepted: boolean }> {
-    // Leaving is an explicit caller action, so it may restore a persisted test
-    // session even when analytics consent has not yet been granted. In contrast,
-    // construction and normal SDK operations must not touch storage while consent
-    // is pending.
+    if (this.consent !== "granted" || this.destroyed) {
+      clearPersistedTestSession(this.options.sourceKey);
+      this.testSession?.clear();
+      return { accepted: true };
+    }
     return (await this.ensureTestSession()).leave();
   }
 
   async probeTestSessionUrl(url: string): Promise<TestSessionProbeResult> {
+    if (this.consent !== "granted" || this.destroyed) throw new Error("CONSENT_REQUIRED");
     return (await this.ensureTestSession()).probe(url);
   }
 
   async runTestSessionProbes(): Promise<TestSessionProbeRunResult> {
+    if (this.consent !== "granted" || this.destroyed) {
+      return {
+        accepted: false,
+        emitted: [],
+        skipped: ["identity", "event", "screen", "experiences"],
+        pendingSignals: 0,
+      };
+    }
     return (await this.ensureTestSession()).runProbes();
   }
 
   reportTestSessionExperienceInteraction(
     interaction: "impression" | "action",
   ): Promise<{ accepted: boolean }> {
+    if (this.consent !== "granted" || this.destroyed) return Promise.resolve({ accepted: false });
     return this.ensureTestSession().then((session) =>
       session.reportExperienceInteraction(interaction),
     );
@@ -492,6 +465,7 @@ export class WtsClientImpl implements WtsClient {
     } catch (error) {
       this.handleRetryableError(error);
     }
+    await this.experiences.setConsent("granted");
     if (this.options.autoTrackPageViews && !this.removeSpaTracker) {
       this.removeSpaTracker = installSpaTracker(() => {
         void this.trackAutomaticPage();
@@ -748,11 +722,14 @@ export class WtsClientImpl implements WtsClient {
     response: IdentityBatchResponse,
   ): void {
     const accepted = new Set([...response.accepted, ...response.duplicates]);
+    let identityModeChanged = false;
     for (const mutation of mutations) {
       if (!accepted.has(mutation.clientMutationId)) continue;
-      if (mutation.type === "identify") this.profileIdentityReady = true;
-      if (mutation.type === "reset_identity") this.profileIdentityReady = false;
+      if (mutation.type === "identify" || mutation.type === "reset_identity") {
+        identityModeChanged = true;
+      }
     }
+    if (identityModeChanged) queueMicrotask(() => void this.experiences.identityChanged());
   }
 
   private async enqueueIdentityMutation(
